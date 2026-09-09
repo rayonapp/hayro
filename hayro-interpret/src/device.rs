@@ -2,6 +2,7 @@ use crate::font::GlyphRun;
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, ClipPath, FillRule, Image};
 use crate::{DrawMode, DrawProps, ImageDrawProps};
+use hayro_syntax::object::{Dict, ObjectIdentifier};
 use kurbo::{BezPath, Rect, Shape};
 
 /// A trait for a device that can be used to process PDF drawing instructions.
@@ -48,6 +49,27 @@ pub trait Device<'a> {
     fn begin_marked_content(&mut self, _tag: &[u8], _mcid: Option<i32>) {}
     /// Called at the end of a marked content sequence (EMC).
     fn end_marked_content(&mut self) {}
+    /// Called at the beginning of an optional-content scope.
+    ///
+    /// The properties describe an optional content group (OCG) or membership dictionary
+    /// (OCMD). The id identifies the dictionary if it is an indirect object.
+    /// `visible` is its visibility in the default configuration, excluding enclosing scopes.
+    ///
+    /// Return whether to process drawing operations in this scope. Returning `true` for
+    /// every scope includes hidden content, for example when importing groups as layers.
+    /// A scope cannot enable drawing suppressed by an enclosing scope. State changes,
+    /// including clipping and text advances, are applied even when drawing is suppressed.
+    /// Contents of suppressed form `XObjects` may be skipped entirely.
+    fn begin_optional_content(
+        &mut self,
+        _id: Option<ObjectIdentifier>,
+        _properties: &Dict<'_>,
+        visible: bool,
+    ) -> bool {
+        visible
+    }
+    /// Called at the end of an optional-content scope, even if its begin returned `false`.
+    fn end_optional_content(&mut self) {}
 }
 
 /// A device that discards all drawing operations.

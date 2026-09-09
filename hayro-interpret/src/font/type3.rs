@@ -13,9 +13,9 @@ use crate::{Image, Paint};
 use hayro_cmap::{BfString, CMap};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_BBOX, FONT_MATRIX, RESOURCES};
+use hayro_syntax::object::{Dict, ObjectIdentifier};
 use hayro_syntax::page::Resources;
 use kurbo::{Affine, BezPath, Rect};
 use rustc_hash::FxHashMap;
@@ -197,6 +197,19 @@ impl<'a, 'b, T: Device<'a>> Type3ShapeGlyphDevice<'a, 'b, T> {
 
 // Only filling, stroking of paths and stencil masks are allowed.
 impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
+    fn begin_optional_content(
+        &mut self,
+        id: Option<ObjectIdentifier>,
+        properties: &Dict<'_>,
+        visible: bool,
+    ) -> bool {
+        self.inner.begin_optional_content(id, properties, visible)
+    }
+
+    fn end_optional_content(&mut self) {
+        self.inner.end_optional_content();
+    }
+
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
         let props = DrawProps {
             paint: self.paint.clone(),

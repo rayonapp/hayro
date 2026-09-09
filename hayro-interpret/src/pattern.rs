@@ -17,7 +17,7 @@ use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{
     BBOX, EXT_G_STATE, MATRIX, PAINT_TYPE, RESOURCES, SHADING, X_STEP, Y_STEP,
 };
-use hayro_syntax::object::{Object, dict_or_stream};
+use hayro_syntax::object::{Object, ObjectIdentifier, dict_or_stream};
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, Rect, Shape};
@@ -295,6 +295,19 @@ impl<'a, 'b, T: Device<'a>> StencilPatternDevice<'a, 'b, T> {
 
 // Only filling, stroking of paths and stencil masks are allowed.
 impl<'a, T: Device<'a>> Device<'a> for StencilPatternDevice<'a, '_, T> {
+    fn begin_optional_content(
+        &mut self,
+        id: Option<ObjectIdentifier>,
+        properties: &Dict<'_>,
+        visible: bool,
+    ) -> bool {
+        self.inner.begin_optional_content(id, properties, visible)
+    }
+
+    fn end_optional_content(&mut self) {
+        self.inner.end_optional_content();
+    }
+
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
         let props = DrawProps {
             paint: self.paint.clone(),

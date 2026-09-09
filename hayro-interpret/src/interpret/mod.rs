@@ -229,6 +229,7 @@ pub fn interpret<'a>(
     device: &mut impl Device<'a>,
 ) {
     let num_states = context.num_states();
+    let content_depth = context.ocg_state.depth();
     let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
 
     context.save_state();
@@ -485,37 +486,44 @@ pub fn interpret<'a>(
 
                 let mcid = dict_or_stream(bdc.1).and_then(|(props, _)| props.get::<i32>(MCID));
 
-                let oc = bdc
-                    .1
-                    .clone()
-                    .into_name()
-                    .and_then(|name| {
-                        let r = resources.properties.get_ref(name.as_ref())?;
-                        let d = resources
-                            .properties
-                            .get::<Dict<'_>>(name)
-                            .unwrap_or_default();
-                        Some((d, r))
-                    })
-                    .or_else(|| {
-                        let (props, _) = dict_or_stream(bdc.1)?;
-                        let r = props.get_ref(OC)?;
-                        let d = props.get::<Dict<'_>>(OC).unwrap_or_default();
-                        Some((d, r))
-                    });
-
-                if let Some((dict, oc_ref)) = oc {
-                    context.ocg_state.begin_ocg(&dict, oc_ref.into());
+                let oc = if bdc.0.as_ref() == OC {
+                    bdc.1
+                        .clone()
+                        .into_name()
+                        .and_then(|name| {
+                            let mut resources = resources;
+                            loop {
+                                if let Some(dict) = resources.properties.get::<Dict<'_>>(&name) {
+                                    let id = resources.properties.get_ref(&name).map(Into::into);
+                                    return Some((dict, id));
+                                }
+                                resources = resources.parent()?;
+                            }
+                        })
+                        .or_else(|| {
+                            let (props, _) = dict_or_stream(bdc.1)?;
+                            let r = props.get_ref(OC)?;
+                            let dict = context.xref.get::<Dict<'_>>(r.into())?;
+                            Some((dict, Some(r.into())))
+                        })
                 } else {
-                    context.ocg_state.begin_marked_content();
-                }
+                    None
+                };
 
                 device.begin_marked_content(bdc.0, mcid);
+
+                if !oc.is_some_and(|(dict, id)| {
+                    context.ocg_state.begin_optional_content(&dict, id, device)
+                }) {
+                    context.ocg_state.begin_marked_content();
+                }
             }
             TypedInstruction::MarkedContentPointWithProperties(_) => {}
             TypedInstruction::EndMarkedContent(_) => {
-                context.ocg_state.end_marked_content();
-                device.end_marked_content();
+                if context.ocg_state.depth() > content_depth {
+                    context.ocg_state.end_marked_content(device);
+                    device.end_marked_content();
+                }
             }
             TypedInstruction::MarkedContentPoint(_) => {}
             TypedInstruction::BeginMarkedContent(bmc) => {
@@ -697,7 +705,7 @@ pub fn interpret<'a>(
                 context.get_mut().text_state.rise = t.0.as_f32();
             }
             TypedInstruction::Shading(s) => {
-                if !context.ocg_state.is_visible() {
+                if !context.ocg_state.should_process() {
                     continue;
                 }
 
@@ -747,6 +755,12 @@ pub fn interpret<'a>(
                 warn!("failed to read an operator");
             }
         }
+    }
+
+    // Close unfinished marked content without disturbing scopes in the calling stream.
+    while context.ocg_state.depth() > content_depth {
+        context.ocg_state.end_marked_content(device);
+        device.end_marked_content();
     }
 
     while context.num_states() > num_states {

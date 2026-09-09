@@ -129,14 +129,14 @@ impl<'a> ImageXObject<'a> {
     }
 
     pub(crate) fn draw<'b>(&self, context: &mut Context<'b>, device: &mut impl Device<'b>) {
-        if !context.ocg_state.is_visible() {
+        if !context.ocg_state.should_process() {
             return;
         }
 
-        let has_oc = xobject_oc(self.stream.dict(), context);
-        if !context.ocg_state.is_visible() {
+        let has_oc = xobject_oc(self.stream.dict(), context, device);
+        if !context.ocg_state.should_process() {
             if has_oc {
-                context.ocg_state.end_marked_content();
+                context.ocg_state.end_marked_content(device);
             }
             return;
         }
@@ -194,7 +194,7 @@ impl<'a> ImageXObject<'a> {
         context.restore_state(device);
 
         if has_oc {
-            context.ocg_state.end_marked_content();
+            context.ocg_state.end_marked_content(device);
         }
     }
 

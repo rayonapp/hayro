@@ -49,7 +49,7 @@ impl<'a> FormXObject<'a> {
         context: &mut Context<'a>,
         device: &mut impl Device<'a>,
     ) {
-        if !context.ocg_state.is_visible() {
+        if !context.ocg_state.should_process() {
             return;
         }
 
@@ -57,10 +57,10 @@ impl<'a> FormXObject<'a> {
             return;
         }
 
-        let has_oc = xobject_oc(&self.dict, context);
-        if !context.ocg_state.is_visible() {
+        let has_oc = xobject_oc(&self.dict, context, device);
+        if !context.ocg_state.should_process() {
             if has_oc {
-                context.ocg_state.end_marked_content();
+                context.ocg_state.end_marked_content(device);
             }
             context.end_nested_interpretation();
             return;
@@ -113,7 +113,7 @@ impl<'a> FormXObject<'a> {
         context.restore_state(device);
 
         if has_oc {
-            context.ocg_state.end_marked_content();
+            context.ocg_state.end_marked_content(device);
         }
 
         context.end_nested_interpretation();
