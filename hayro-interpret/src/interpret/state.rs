@@ -3,18 +3,17 @@ use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
 use crate::font::{Font, UNITS_PER_EM};
-use crate::function::Function;
+use crate::function::{Function, TransferFunction};
 use crate::interpret::text::TextRenderingMode;
 use crate::pattern::Pattern;
-use crate::soft_mask::SoftMask;
 use crate::types::BlendMode;
 use crate::util::OptionLog;
+use crate::x_object::soft_mask::SoftMask;
 use hayro_syntax::content::ops::{LineCap, LineJoin};
 use hayro_syntax::object::dict::keys::{FONT, SMASK, TR, TR2};
 use hayro_syntax::object::{Array, Dict, Name, Number, Object};
 use hayro_syntax::page::Resources;
 use kurbo::{Affine, BezPath, Vec2};
-use log::warn;
 use smallvec::smallvec;
 use std::ops::Deref;
 
@@ -22,9 +21,9 @@ use std::ops::Deref;
 #[derive(Clone, Debug)]
 pub enum ActiveTransferFunction {
     /// A single transfer function applied to all components.
-    Single(Function),
+    Single(TransferFunction),
     /// Four transfer functions, one for each component.
-    Four([Function; 4]),
+    Four([TransferFunction; 4]),
 }
 
 impl ActiveTransferFunction {
@@ -36,21 +35,29 @@ impl ActiveTransferFunction {
         match self {
             Self::Single(f) => {
                 for c in &mut rgba[..3] {
-                    if let Some(out) = f.eval(smallvec![*c]) {
-                        *c = out[0];
-                    }
+                    *c = f.apply_f32(*c);
                 }
             }
             Self::Four(functions) => {
                 for (i, f) in functions[..3].iter().enumerate() {
-                    if let Some(out) = f.eval(smallvec![rgba[i]]) {
-                        rgba[i] = out[0];
-                    }
+                    rgba[i] = f.apply_f32(rgba[i]);
                 }
             }
         }
 
         AlphaColor::new(rgba)
+    }
+
+    pub(crate) fn apply_to(&self, values: &mut [u8]) {
+        match self {
+            Self::Single(function) => function.apply_to(values),
+            Self::Four(functions) => {
+                // Since we are converting to RGB, we only need the first three.
+                for (channel, function) in functions[..3].iter().enumerate() {
+                    function.apply_to_stride(&mut values[channel..], 3);
+                }
+            }
+        }
     }
 }
 
@@ -314,7 +321,7 @@ pub(crate) fn handle_gs<'a>(
 
 pub(crate) fn handle_gs_single<'a>(
     dict: &Dict<'a>,
-    key: Name,
+    key: Name<'_>,
     context: &mut Context<'a>,
     parent_resources: &Resources<'a>,
 ) -> Option<()> {
@@ -340,23 +347,25 @@ pub(crate) fn handle_gs_single<'a>(
                 Object::Array(array) => {
                     let mut iter = array.iter::<Object<'_>>();
                     let functions = [
-                        Function::new(&iter.next()?)?,
-                        Function::new(&iter.next()?)?,
-                        Function::new(&iter.next()?)?,
-                        Function::new(&iter.next()?)?,
+                        TransferFunction::new(Function::new(&iter.next()?)?),
+                        TransferFunction::new(Function::new(&iter.next()?)?),
+                        TransferFunction::new(Function::new(&iter.next()?)?),
+                        TransferFunction::new(Function::new(&iter.next()?)?),
                     ];
 
                     Some(ActiveTransferFunction::Four(functions))
                 }
                 // Only `Identity` and `Default` are valid, which both just reset it.
                 Object::Name(_) => None,
-                o => Some(ActiveTransferFunction::Single(Function::new(&o)?)),
+                o => Some(ActiveTransferFunction::Single(TransferFunction::new(
+                    Function::new(&o)?,
+                ))),
             };
 
             context.get_mut().graphics_state.transfer_function = function;
         }
         "SMask" => {
-            if let Some(name) = dict.get::<Name>(SMASK) {
+            if let Some(name) = dict.get::<Name<'_>>(SMASK) {
                 if name.deref() == b"None" {
                     context.get_mut().graphics_state.soft_mask = None;
                 }
@@ -367,14 +376,14 @@ pub(crate) fn handle_gs_single<'a>(
             }
         }
         "BM" => {
-            if let Some(name) = dict.get::<Name>(key.clone()) {
+            if let Some(name) = dict.get::<Name<'_>>(key.as_ref()) {
                 if let Some(bm) = convert_blend_mode(name.as_str()) {
                     context.get_mut().graphics_state.blend_mode = bm;
 
                     return Some(());
                 }
             } else if let Some(arr) = dict.get::<Array<'_>>(key) {
-                for name in arr.iter::<Name>() {
+                for name in arr.iter::<Name<'_>>() {
                     if let Some(bm) = convert_blend_mode(name.as_str()) {
                         context.get_mut().graphics_state.blend_mode = bm;
 

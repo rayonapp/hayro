@@ -1,36 +1,80 @@
 use crate::SvgRenderer;
-use hayro_interpret::{FillRule, Paint, PathDrawMode};
-use kurbo::{Affine, BezPath, PathEl};
+use hayro_interpret::{DrawMode, DrawProps, FillRule};
+use kurbo::{BezPath, PathEl, Rect, Shape};
 use std::io;
 use std::io::Write;
 
 impl<'a> SvgRenderer<'a> {
-    pub(crate) fn draw_path(
-        &mut self,
-        path: &BezPath,
-        transform: Affine,
-        paint: &Paint<'a>,
-        draw_mode: &PathDrawMode,
-    ) {
+    pub(crate) fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
         let svg_path = path.to_svg_f32();
 
         self.xml.start_element("path");
         self.xml.write_attribute("d", &svg_path);
 
         match draw_mode {
-            PathDrawMode::Fill(f) => {
+            DrawMode::Fill(f) => {
                 if *f == FillRule::EvenOdd {
                     self.xml.write_attribute("fill-rule", "evenodd");
                 }
-                self.write_paint(paint, path, transform, None);
+                self.write_paint(&props.paint, || path.bounding_box(), props.transform, None);
             }
-            PathDrawMode::Stroke(s) => {
+            DrawMode::Stroke(s) => {
                 self.write_stroke_properties(s);
-                self.write_paint(paint, path, transform, Some(s));
+                self.write_paint(
+                    &props.paint,
+                    || path.bounding_box(),
+                    props.transform,
+                    Some(s),
+                );
+            }
+            DrawMode::FillAndStroke(f, s) => {
+                if *f == FillRule::EvenOdd {
+                    self.xml.write_attribute("fill-rule", "evenodd");
+                }
+                self.write_stroke_properties(s);
+                self.write_fill_and_stroke_paint(
+                    &props.paint,
+                    || path.bounding_box(),
+                    props.transform,
+                    s,
+                );
+            }
+            DrawMode::Invisible => {
+                self.xml.end_element();
+                return;
             }
         }
 
-        self.write_transform(transform);
+        self.write_transform(props.transform);
+        self.xml.end_element();
+    }
+
+    pub(crate) fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        self.xml.start_element("rect");
+        self.xml.write_attribute("x", &rect.x0);
+        self.xml.write_attribute("y", &rect.y0);
+        self.xml.write_attribute("width", &rect.width());
+        self.xml.write_attribute("height", &rect.height());
+
+        match draw_mode {
+            DrawMode::Fill(_) => {
+                self.write_paint(&props.paint, || *rect, props.transform, None);
+            }
+            DrawMode::Stroke(s) => {
+                self.write_stroke_properties(s);
+                self.write_paint(&props.paint, || *rect, props.transform, Some(s));
+            }
+            DrawMode::FillAndStroke(_, s) => {
+                self.write_stroke_properties(s);
+                self.write_fill_and_stroke_paint(&props.paint, || *rect, props.transform, s);
+            }
+            DrawMode::Invisible => {
+                self.xml.end_element();
+                return;
+            }
+        }
+
+        self.write_transform(props.transform);
         self.xml.end_element();
     }
 }

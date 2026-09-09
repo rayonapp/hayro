@@ -19,17 +19,19 @@ This crate has one optional feature:
 use crate::clip::CachedClipPath;
 use crate::glyph::{CachedOutlineGlyph, CachedType3Glyph};
 use crate::mask::MaskKind;
-use crate::paint::{CachedShading, CachedShadingPattern, CachedTilingPattern};
-use hayro_interpret::font::Glyph;
+use crate::paint::{
+    CachedNativeGradient, CachedShading, CachedShadingPattern, CachedTilingPattern,
+};
+use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::page::Page;
-use hayro_interpret::util::{Float32Ext, PageExt};
+use hayro_interpret::util::{Float32Ext, TransformExt};
 use hayro_interpret::{
-    BlendMode, CacheKey, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterSettings,
-    Paint, PathDrawMode, SoftMask, StrokeProps, interpret_page,
+    BlendMode, CacheKey, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
+    InterpreterCache, InterpreterSettings, SoftMask, StrokeProps, interpret_page,
 };
 use kurbo::{Affine, BezPath, Cap, Join, Rect};
+use rustc_hash::FxHashMap;
 use siphasher::sip128::{Hasher128, SipHasher13};
-use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
@@ -45,20 +47,40 @@ mod mask;
 pub(crate) mod paint;
 mod path;
 
+/// A cache used by the SVG converter.
+///
+/// Ideally, such a cache should be constructed once per PDF and then reused across
+/// multiple conversion invocations on the same document.
+#[derive(Clone, Default)]
+pub struct RenderCache<'a> {
+    pub(crate) interpreter_cache: InterpreterCache<'a>,
+}
+
+impl<'a> RenderCache<'a> {
+    /// Create a new render cache.
+    pub fn new() -> Self {
+        Self {
+            interpreter_cache: InterpreterCache::new(),
+        }
+    }
+}
+
 /// Convert the given page into an SVG string.
-pub fn convert(
-    page: &Page<'_>,
+pub fn convert<'a>(
+    page: &'a Page<'a>,
+    cache: &RenderCache<'a>,
     interpreter_settings: &InterpreterSettings,
     render_settings: &SvgRenderSettings,
 ) -> String {
     let mut state = Context::new(
-        page.initial_transform(true),
+        page.initial_transform(true).to_kurbo(),
         Rect::new(
             0.0,
             0.0,
             page.render_dimensions().0 as f64,
             page.render_dimensions().1 as f64,
         ),
+        &cache.interpreter_cache,
         page.xref(),
         interpreter_settings.clone(),
     );
@@ -95,11 +117,11 @@ pub(crate) struct SvgRenderer<'a> {
     pub(crate) clip_paths: Deduplicator<CachedClipPath>,
     pub(crate) masks: Deduplicator<MaskKind<'a>>,
     pub(crate) shadings: Deduplicator<CachedShading>,
+    pub(crate) gradients: Deduplicator<CachedNativeGradient>,
     pub(crate) shading_patterns: Deduplicator<CachedShadingPattern>,
     pub(crate) tiling_patterns: Deduplicator<CachedTilingPattern<'a>>,
+    active_clips: Vec<Id>,
     pub(crate) dimensions: (f32, f32),
-    pub(crate) cur_mask: Option<SoftMask<'a>>,
-    pub(crate) cur_blend_mode: BlendMode,
 }
 
 impl<'a> SvgRenderer<'a> {
@@ -170,6 +192,11 @@ impl<'a> SvgRenderer<'a> {
         if !opacity.is_nearly_equal(1.0) {
             self.xml.write_attribute("opacity", &opacity.to_string());
         }
+
+        if let Some(clip_id) = self.active_clips.last() {
+            self.xml
+                .write_attribute_fmt("clip-path", format_args!("url(#{clip_id})"));
+        }
     }
 
     pub(crate) fn write_stroke_properties(&mut self, stroke_props: &StrokeProps) {
@@ -213,11 +240,17 @@ impl<'a> SvgRenderer<'a> {
         }
     }
 
-    fn with_group(&mut self, func: impl FnOnce(&mut Self)) {
-        let push_group = self.cur_mask.is_some() || self.cur_blend_mode != BlendMode::Normal;
+    fn with_group(
+        &mut self,
+        mask: Option<SoftMask<'a>>,
+        blend_mode: BlendMode,
+        func: impl FnOnce(&mut Self),
+    ) {
+        let push_group =
+            mask.is_some() || blend_mode != BlendMode::Normal || !self.active_clips.is_empty();
 
         if push_group {
-            self.push_transparency_group(1.0, self.cur_mask.clone(), self.cur_blend_mode);
+            self.push_transparency_group(1.0, mask, blend_mode);
         }
 
         func(self);
@@ -229,37 +262,45 @@ impl<'a> SvgRenderer<'a> {
 }
 
 impl<'a> Device<'a> for SvgRenderer<'a> {
-    fn set_soft_mask(&mut self, mask: Option<SoftMask<'a>>) {
-        self.cur_mask = mask;
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        self.with_group(props.soft_mask.clone(), props.blend_mode, |r| {
+            Self::draw_path(r, path, props, draw_mode);
+        });
     }
 
-    fn set_blend_mode(&mut self, blend_mode: BlendMode) {
-        self.cur_blend_mode = blend_mode;
-    }
-
-    fn draw_path(
-        &mut self,
-        path: &BezPath,
-        transform: Affine,
-        paint: &Paint<'a>,
-        draw_mode: &PathDrawMode,
-    ) {
-        self.with_group(|r| {
-            Self::draw_path(r, path, transform, paint, draw_mode);
+    fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        self.with_group(props.soft_mask.clone(), props.blend_mode, |r| {
+            Self::draw_rect(r, rect, props, draw_mode);
         });
     }
 
     fn push_clip_path(&mut self, clip_path: &ClipPath) {
+        let parent = self.active_clips.last().copied();
+        let clip_id =
+            self.clip_paths
+                .insert_with(hash128(&(clip_path.cache_key(), parent)), || {
+                    CachedClipPath::Path {
+                        path: clip_path.path.clone(),
+                        fill_rule: clip_path.fill,
+                        parent,
+                    }
+                });
+
+        self.active_clips.push(clip_id);
+    }
+
+    fn push_clip_rect(&mut self, rect: &Rect) {
+        let parent = self.active_clips.last().copied();
         let clip_id = self
             .clip_paths
-            .insert_with(clip_path.cache_key(), || CachedClipPath {
-                path: clip_path.path.clone(),
-                fill_rule: clip_path.fill,
+            .insert_with(hash128(&(rect.cache_key(), parent)), || {
+                CachedClipPath::Rect {
+                    rect: *rect,
+                    parent,
+                }
             });
 
-        self.xml.start_element("g");
-        self.xml
-            .write_attribute_fmt("clip-path", format_args!("url(#{clip_id})"));
+        self.active_clips.push(clip_id);
     }
 
     fn push_transparency_group(
@@ -271,51 +312,49 @@ impl<'a> Device<'a> for SvgRenderer<'a> {
         self.push_transparency_group_inner(opacity, mask.map(MaskKind::SoftMask), blend_mode);
     }
 
-    fn draw_glyph(
+    fn draw_glyph_run(
         &mut self,
-        glyph: &Glyph<'a>,
-        transform: Affine,
-        glyph_transform: Affine,
-        paint: &Paint<'a>,
-        draw_mode: &GlyphDrawMode,
+        glyph_run: &GlyphRun<'_, 'a>,
+        props: DrawProps<'a>,
+        draw_mode: &DrawMode,
     ) {
-        self.with_group(|r| {
-            Self::draw_glyph(r, glyph, transform, glyph_transform, paint, draw_mode);
+        self.with_group(props.soft_mask.clone(), props.blend_mode, |r| {
+            Self::draw_glyph_run(r, glyph_run, props, draw_mode);
         });
     }
 
-    fn draw_image(&mut self, image: Image<'a, '_>, mut transform: Affine) {
-        // TODO: Use Self::group
-        match image {
-            Image::Stencil(s) => {
-                s.with_stencil(
-                    |s, paint| {
-                        transform *= Affine::scale_non_uniform(
-                            s.scale_factors.0 as f64,
-                            s.scale_factors.1 as f64,
-                        );
-                        Self::draw_stencil_image(self, s, transform, paint);
-                    },
-                    None,
-                );
+    fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
+        self.with_group(props.soft_mask.clone(), props.blend_mode, |r| {
+            let mut transform = props.transform;
+            match image {
+                Image::Stencil(s) => {
+                    s.with_stencil(
+                        |s, paint| {
+                            transform *= Affine::scale_non_uniform(
+                                s.scale_factors.0 as f64,
+                                s.scale_factors.1 as f64,
+                            );
+                            Self::draw_stencil_image(r, s, transform, paint);
+                        },
+                        None,
+                    );
+                }
+                Image::Raster(raster) => {
+                    raster.with_rgba(
+                        |image, alpha| {
+                            let (sx, sy) = image.scale_factors();
+                            transform *= Affine::scale_non_uniform(sx as f64, sy as f64);
+                            Self::draw_rgba_image(r, image, transform, alpha);
+                        },
+                        None,
+                    );
+                }
             }
-            Image::Raster(r) => {
-                r.with_rgba(
-                    |rgb, alpha| {
-                        transform *= Affine::scale_non_uniform(
-                            rgb.scale_factors.0 as f64,
-                            rgb.scale_factors.1 as f64,
-                        );
-                        Self::draw_rgba_image(self, rgb, transform, alpha);
-                    },
-                    None,
-                );
-            }
-        }
+        });
     }
 
-    fn pop_clip_path(&mut self) {
-        self.xml.end_element();
+    fn pop_clip(&mut self) {
+        self.active_clips.pop();
     }
 
     fn pop_transparency_group(&mut self) {
@@ -333,11 +372,11 @@ impl<'a> SvgRenderer<'a> {
             clip_paths: Deduplicator::new('c'),
             masks: Deduplicator::new('m'),
             shadings: Deduplicator::new('s'),
+            gradients: Deduplicator::new('n'),
             shading_patterns: Deduplicator::new('v'),
             tiling_patterns: Deduplicator::new('t'),
-            cur_mask: None,
+            active_clips: Vec::new(),
             dimensions: page.render_dimensions(),
-            cur_blend_mode: BlendMode::default(),
         }
     }
 
@@ -382,6 +421,7 @@ impl<'a> SvgRenderer<'a> {
         self.write_mask_defs();
         self.write_clip_path_defs();
         self.write_shading_defs();
+        self.write_native_gradient_defs();
         self.write_shading_pattern_defs();
         self.write_tiling_pattern_defs();
         // Close the `svg` element.
@@ -403,7 +443,7 @@ pub(crate) fn convert_transform(transform: &Affine) -> String {
 pub(crate) struct Deduplicator<T> {
     kind: char,
     vec: Vec<T>,
-    present: HashMap<u128, Id>,
+    present: FxHashMap<u128, Id>,
 }
 
 impl<T> Default for Deduplicator<T> {
@@ -417,7 +457,7 @@ impl<T> Deduplicator<T> {
         Self {
             kind,
             vec: Vec::new(),
-            present: HashMap::new(),
+            present: FxHashMap::default(),
         }
     }
 

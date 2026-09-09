@@ -10,10 +10,10 @@ use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::dict::keys::{BASE_FONT, FONT_DESC, FONT_WEIGHT, ITALIC_ANGLE};
 use kurbo::BezPath;
+use rustc_hash::FxHashMap;
+use skrifa::GlyphId;
 use skrifa::raw::TableProvider;
-use skrifa::{GlyphId, GlyphId16};
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 /// The 14 standard fonts of PDF.
 #[derive(Copy, Clone, Debug)]
@@ -211,7 +211,7 @@ pub(crate) fn select_standard_font(
     dict: &Dict<'_>,
     descriptor: &Dict<'_>,
 ) -> Option<(StandardFont, bool)> {
-    let base_font = dict.get::<Name>(BASE_FONT)?;
+    let base_font = dict.get::<Name<'_>>(BASE_FONT)?;
     let name = strip_subset_prefix(base_font.as_str());
 
     // First try whether it matches literally.
@@ -285,7 +285,7 @@ pub(crate) fn select_standard_font(
 #[derive(Debug)]
 pub(crate) enum StandardFontBlob {
     Cff(CffFontBlob),
-    Otf(OpenTypeFontBlob, HashMap<String, GlyphId>),
+    Otf(OpenTypeFontBlob, FxHashMap<String, GlyphId>),
 }
 
 impl StandardFontBlob {
@@ -302,16 +302,7 @@ impl StandardFontBlob {
     }
 
     pub(crate) fn new_otf(blob: OpenTypeFontBlob) -> Self {
-        let mut glyph_names = HashMap::new();
-
-        if let Ok(post) = blob.font_ref().post() {
-            for i in 0..blob.num_glyphs() {
-                if let Some(str) = post.glyph_name(GlyphId16::new(i)) {
-                    glyph_names.insert(str.to_string(), GlyphId::new(i as u32));
-                }
-            }
-        }
-
+        let glyph_names = blob.glyph_names();
         Self::Otf(blob, glyph_names)
     }
 }
@@ -319,10 +310,7 @@ impl StandardFontBlob {
 impl StandardFontBlob {
     pub(crate) fn name_to_glyph(&self, name: &str) -> Option<GlyphId> {
         match self {
-            Self::Cff(blob) => blob
-                .table()
-                .glyph_index_by_name(name)
-                .map(|g| GlyphId::new(g.0 as u32)),
+            Self::Cff(blob) => blob.glyph_index_by_name(name),
             Self::Otf(_, glyph_names) => glyph_names.get(name).copied(),
         }
     }
@@ -367,8 +355,9 @@ pub(crate) struct StandardKind {
     widths: Vec<Width>,
     missing_width: f32,
     fallback: bool,
-    glyph_to_code: RefCell<HashMap<GlyphId, u8>>,
-    encodings: HashMap<u8, String>,
+    code_to_glyph: RefCell<FxHashMap<u8, GlyphId>>,
+    glyph_to_code: RefCell<FxHashMap<GlyphId, u8>>,
+    encodings: FxHashMap<u8, String>,
 }
 
 impl StandardKind {
@@ -403,7 +392,8 @@ impl StandardKind {
             widths,
             missing_width,
             encodings: encoding_map,
-            glyph_to_code: RefCell::new(HashMap::new()),
+            code_to_glyph: RefCell::new(FxHashMap::default()),
+            glyph_to_code: RefCell::new(FxHashMap::default()),
             fallback,
             encoding,
         })
@@ -422,6 +412,12 @@ impl StandardKind {
     }
 
     pub(crate) fn map_code(&self, code: u8) -> GlyphId {
+        let mut code_to_glyph = self.code_to_glyph.borrow_mut();
+
+        if let Some(glyph) = code_to_glyph.get(&code).copied() {
+            return glyph;
+        }
+
         let result = self
             .code_to_ps_name(code)
             .and_then(|c| {
@@ -434,6 +430,7 @@ impl StandardKind {
                 })
             })
             .unwrap_or(GlyphId::NOTDEF);
+        code_to_glyph.insert(code, result);
         self.glyph_to_code.borrow_mut().insert(result, code);
 
         result

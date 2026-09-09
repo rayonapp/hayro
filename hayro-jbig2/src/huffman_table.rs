@@ -50,7 +50,7 @@ impl HuffmanTable {
 
     /// Build a Huffman table from table line definitions (B.3 "Assigning
     /// the prefix codes").
-    pub(crate) fn build(lines: &[TableLine]) -> Self {
+    pub(crate) fn build(lines: &[TableLine]) -> Result<Self> {
         // `NTEMP` - Number of table lines.
         let line_count = lines.len();
 
@@ -59,6 +59,11 @@ impl HuffmanTable {
         // that the value I occurs in the array PREFLEN."
         // `LENMAX` - Maximum prefix length.
         let max_prefix_length = lines.iter().map(|l| l.prefix_length).max().unwrap_or(0) as usize;
+
+        if max_prefix_length > 32 {
+            bail!(HuffmanError::PrefixLengthTooLarge);
+        }
+
         // `LENCOUNT` - Histogram of prefix lengths.
         let mut length_counts = vec![0_u32; max_prefix_length + 1];
         for line in lines {
@@ -79,8 +84,10 @@ impl HuffmanTable {
             // a) "Set: FIRSTCODE[CURLEN] = (FIRSTCODE[CURLEN − 1] + LENCOUNT[CURLEN − 1]) × 2
             //         CURCODE = FIRSTCODE[CURLEN]
             //         CURTEMP = 0"
-            first_code_per_length[current_length] =
-                (first_code_per_length[current_length - 1] + length_counts[current_length - 1]) * 2;
+            first_code_per_length[current_length] = (first_code_per_length[current_length - 1]
+                + length_counts[current_length - 1])
+                .checked_mul(2)
+                .ok_or(HuffmanError::InvalidCode)?;
             // `CURCODE` - Current code value being assigned.
             let mut current_code = first_code_per_length[current_length];
 
@@ -92,7 +99,9 @@ impl HuffmanTable {
                 //        CURCODE = CURCODE + 1"
                 if lines[line_index].prefix_length as usize == current_length {
                     assigned_codes[line_index] = current_code;
-                    current_code += 1;
+                    current_code = current_code
+                        .checked_add(1)
+                        .ok_or(HuffmanError::InvalidCode)?;
                 }
                 // ii) "Set CURTEMP = CURTEMP + 1" (implicit in for loop)
             }
@@ -117,10 +126,10 @@ impl HuffmanTable {
                 line.range_length,
                 line.is_lower,
                 line.is_out_of_band,
-            );
+            )?;
         }
 
-        Self::from_dynamic(nodes)
+        Ok(Self::from_dynamic(nodes))
     }
 
     /// Build a uniform Huffman table where all symbols have the same code length.
@@ -128,7 +137,7 @@ impl HuffmanTable {
     /// This is used for symbol ID encoding (6.5.8.2.3): "For each value of i from
     /// 0 to SDNUMINSYMS + NSYMSDECODED – 1, set SBSYMCODES[i] to the binary
     /// representation of i using a SBSYMCODELEN-bit string."
-    pub(crate) fn build_uniform(num_symbols: u32, code_length: u32) -> Self {
+    pub(crate) fn build_uniform(num_symbols: u32, code_length: u32) -> Result<Self> {
         let lines: Vec<TableLine> = (0..num_symbols)
             .map(|i| TableLine::new(i as i32, code_length as u8, 0))
             .collect();
@@ -145,12 +154,12 @@ impl HuffmanTable {
         range_length: u8,
         is_lower: bool,
         is_out_of_band: bool,
-    ) {
+    ) -> Result<()> {
         if prefix_length == 0 {
             // We've consumed all bits, this should be a leaf.
             nodes[node_index as usize] =
                 HuffmanNode::new_leaf(range_low, range_length, is_lower, is_out_of_band);
-            return;
+            return Ok(());
         }
 
         // Get the next bit (MSB first).
@@ -162,7 +171,7 @@ impl HuffmanTable {
             None => {
                 let new_idx = NonZeroU32::new(nodes.len() as u32).unwrap();
                 nodes.push(HuffmanNode::new_intermediate());
-                nodes[node_index as usize].set_child(bit == 0, new_idx);
+                nodes[node_index as usize].set_child(bit == 0, new_idx)?;
                 new_idx
             }
         };
@@ -176,7 +185,7 @@ impl HuffmanTable {
             range_length,
             is_lower,
             is_out_of_band,
-        );
+        )
     }
 
     /// Read a custom Huffman table from the bitstream (B.2 "Decoding a code table").
@@ -243,7 +252,9 @@ impl HuffmanTable {
         //         RANGELOW[NTEMP] = HTLOW − 1, NTEMP = NTEMP + 1
         //    This is the lower range table line for this table."
         lines.push(TableLine::lower(
-            minimum_value - 1,
+            minimum_value
+                .checked_sub(1)
+                .ok_or(HuffmanError::InvalidCode)?,
             reader
                 .read_bits(prefix_length_bits)
                 .ok_or(HuffmanError::InvalidCode)? as u8,
@@ -275,7 +286,7 @@ impl HuffmanTable {
         }
 
         // 11) "Create the prefix codes using the algorithm described in B.3."
-        Ok(Self::build(&lines))
+        Self::build(&lines)
     }
 }
 
@@ -387,7 +398,11 @@ impl HuffmanNode {
     }
 
     /// Set the child index for a given bit (0 or 1).
-    fn set_child(&mut self, child_zero: bool, index: NonZeroU32) {
+    fn set_child(
+        &mut self,
+        child_zero: bool,
+        index: NonZeroU32,
+    ) -> core::result::Result<(), HuffmanError> {
         match self {
             Self::Intermediate { zero, one } => {
                 if child_zero {
@@ -395,8 +410,9 @@ impl HuffmanNode {
                 } else {
                     *one = Some(index);
                 }
+                Ok(())
             }
-            _ => panic!("set_child called on non-intermediate node"),
+            _ => Err(HuffmanError::ConflictingCodes),
         }
     }
 
@@ -498,6 +514,12 @@ pub(crate) struct StandardHuffmanTables {
     table_m: Lazy<HuffmanTable>,
     table_n: Lazy<HuffmanTable>,
     table_o: Lazy<HuffmanTable>,
+}
+
+impl Default for StandardHuffmanTables {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StandardHuffmanTables {

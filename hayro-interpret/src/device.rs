@@ -1,26 +1,23 @@
-use crate::font::Glyph;
-use crate::soft_mask::SoftMask;
-use crate::{BlendMode, ClipPath, Image};
-use crate::{GlyphDrawMode, Paint, PathDrawMode};
-use kurbo::{Affine, BezPath, Rect, Shape};
+use crate::font::GlyphRun;
+use crate::x_object::soft_mask::SoftMask;
+use crate::{BlendMode, ClipPath, FillRule, Image};
+use crate::{DrawMode, DrawProps, ImageDrawProps};
+use hayro_syntax::object::{Dict, ObjectIdentifier};
+use kurbo::{BezPath, Rect, Shape};
 
 /// A trait for a device that can be used to process PDF drawing instructions.
 pub trait Device<'a> {
-    /// Set the properties for future stroking operations.
-    /// Set a soft mask to be used for future drawing instructions.
-    fn set_soft_mask(&mut self, mask: Option<SoftMask<'a>>);
-    /// Set the blend mode that should be used for rendering operations.
-    fn set_blend_mode(&mut self, blend_mode: BlendMode);
     /// Draw a path.
-    fn draw_path(
-        &mut self,
-        path: &BezPath,
-        transform: Affine,
-        paint: &Paint<'a>,
-        draw_mode: &PathDrawMode,
-    );
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode);
     /// Push a new clip path to the clip stack.
     fn push_clip_path(&mut self, clip_path: &ClipPath);
+    /// Push a rectangular clip to the clip stack.
+    fn push_clip_rect(&mut self, rect: &Rect) {
+        self.push_clip_path(&ClipPath {
+            path: rect.to_path(0.1),
+            fill: FillRule::NonZero,
+        });
+    }
     /// Push a new transparency group to the blend stack.
     fn push_transparency_group(
         &mut self,
@@ -28,31 +25,22 @@ pub trait Device<'a> {
         mask: Option<SoftMask<'a>>,
         blend_mode: BlendMode,
     );
-    /// Draw a glyph.
-    fn draw_glyph(
+    /// Draw a run of positioned glyphs.
+    fn draw_glyph_run(
         &mut self,
-        glyph: &Glyph<'a>,
-        transform: Affine,
-        glyph_transform: Affine,
-        paint: &Paint<'a>,
-        // TODO: Move this into outline glyph.
-        draw_mode: &GlyphDrawMode,
+        glyph_run: &GlyphRun<'_, 'a>,
+        props: DrawProps<'a>,
+        draw_mode: &DrawMode,
     );
     /// Draw an image.
-    fn draw_image(&mut self, image: Image<'a, '_>, transform: Affine);
-    /// Pop the last clip path from the clip stack.
-    fn pop_clip_path(&mut self);
+    fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>);
+    /// Pop the last clip path or clip rectangle from the clip stack.
+    fn pop_clip(&mut self);
     /// Pop the last transparency group from the blend stack.
     fn pop_transparency_group(&mut self);
     /// Draw a rectangle directly, without going through the general path pipeline.
-    fn draw_rect(
-        &mut self,
-        rect: &Rect,
-        transform: Affine,
-        paint: &Paint<'a>,
-        draw_mode: &PathDrawMode,
-    ) {
-        self.draw_path(&rect.to_path(0.1), transform, paint, draw_mode);
+    fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        self.draw_path(&rect.to_path(0.1), props, draw_mode);
     }
     /// Called at the beginning of a marked content sequence (BMC/BDC).
     ///
@@ -61,27 +49,38 @@ pub trait Device<'a> {
     fn begin_marked_content(&mut self, _tag: &[u8], _mcid: Option<i32>) {}
     /// Called at the end of a marked content sequence (EMC).
     fn end_marked_content(&mut self) {}
+    /// Called at the beginning of an optional-content scope.
+    ///
+    /// The properties describe an optional content group (OCG) or membership dictionary
+    /// (OCMD). The id identifies the dictionary if it is an indirect object.
+    /// `visible` is its visibility in the default configuration, excluding enclosing scopes.
+    ///
+    /// Return whether to process drawing operations in this scope. Returning `true` for
+    /// every scope includes hidden content, for example when importing groups as layers.
+    /// A scope cannot enable drawing suppressed by an enclosing scope. State changes,
+    /// including clipping and text advances, are applied even when drawing is suppressed.
+    /// Contents of suppressed form `XObjects` may be skipped entirely.
+    fn begin_optional_content(
+        &mut self,
+        _id: Option<ObjectIdentifier>,
+        _properties: &Dict<'_>,
+        visible: bool,
+    ) -> bool {
+        visible
+    }
+    /// Called at the end of an optional-content scope, even if its begin returned `false`.
+    fn end_optional_content(&mut self) {}
 }
 
 /// A device that discards all drawing operations.
 pub struct DummyDevice;
 
 impl Device<'_> for DummyDevice {
-    fn set_soft_mask(&mut self, _: Option<SoftMask<'_>>) {}
-    fn set_blend_mode(&mut self, _: BlendMode) {}
-    fn draw_path(&mut self, _: &BezPath, _: Affine, _: &Paint<'_>, _: &PathDrawMode) {}
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'_>, _: &DrawMode) {}
     fn push_clip_path(&mut self, _: &ClipPath) {}
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'_>>, _: BlendMode) {}
-    fn draw_glyph(
-        &mut self,
-        _: &Glyph<'_>,
-        _: Affine,
-        _: Affine,
-        _: &Paint<'_>,
-        _: &GlyphDrawMode,
-    ) {
-    }
-    fn draw_image(&mut self, _: Image<'_, '_>, _: Affine) {}
-    fn pop_clip_path(&mut self) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, '_>, _: DrawProps<'_>, _: &DrawMode) {}
+    fn draw_image(&mut self, _: Image<'_, '_>, _: ImageDrawProps<'_>) {}
+    fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
 }

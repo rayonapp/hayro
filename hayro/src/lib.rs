@@ -33,17 +33,23 @@ This crate has one optional feature:
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use crate::renderer::Renderer;
+use fearless_simd::Level;
 use hayro_interpret::Device;
 use hayro_interpret::FillRule;
+use hayro_interpret::InterpreterCache;
 use hayro_interpret::InterpreterSettings;
+use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::page::Page;
-use hayro_interpret::util::{PageExt, RectExt};
-use hayro_interpret::{BlendMode, Context};
+use hayro_interpret::util::{RectExt, TransformExt};
+use hayro_interpret::{BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask};
 use hayro_interpret::{ClipPath, interpret_page};
-use kurbo::{Affine, Rect, Shape};
+use kurbo::{Affine, BezPath, Rect, Shape};
+use pic_scale::Scaler;
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::ops::RangeInclusive;
+use std::rc::Rc;
 
 pub use hayro_interpret;
 pub use hayro_interpret::hayro_syntax;
@@ -53,9 +59,147 @@ use vello_cpu::color::AlphaColor;
 use vello_cpu::color::Srgb;
 use vello_cpu::color::palette::css::TRANSPARENT;
 use vello_cpu::color::palette::css::WHITE;
-use vello_cpu::{Level, Pixmap, RenderMode};
+use vello_cpu::peniko::{Compose, Fill, Mix};
+use vello_cpu::{Mask, Pixmap, RenderContext, peniko};
 
-mod renderer;
+mod clip;
+mod glyph;
+mod image;
+mod mask;
+mod paint;
+mod path;
+
+pub(crate) struct GlobalState {
+    level: Level,
+    outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+    scaler: Scaler,
+}
+
+impl GlobalState {
+    pub(crate) fn new(cache: &RenderCache<'_>) -> Self {
+        Self {
+            level: Level::new(),
+            outline_cache: cache.outline_cache.clone(),
+            scaler: Scaler::new(image::RESAMPLING_FUNCTION),
+        }
+    }
+}
+
+pub(crate) struct Renderer<'a> {
+    global: &'a GlobalState,
+    pub(crate) ctx: RenderContext,
+    pub(crate) inside_pattern: bool,
+    pub(crate) soft_mask_cache: FxHashMap<u128, Mask>,
+    pub(crate) in_type3_glyph: bool,
+}
+
+impl<'r> Renderer<'r> {
+    pub(crate) fn new(
+        width: u16,
+        height: u16,
+        settings: vello_cpu::RenderSettings,
+        global: &'r GlobalState,
+    ) -> Self {
+        Self {
+            global,
+            ctx: RenderContext::new_with(width, height, settings),
+            inside_pattern: false,
+            soft_mask_cache: FxHashMap::default(),
+            in_type3_glyph: false,
+        }
+    }
+
+    fn child(&self, width: u16, height: u16) -> Self {
+        Self::new(
+            width,
+            height,
+            derive_settings(self.ctx.render_settings()),
+            self.global,
+        )
+    }
+
+    fn apply_draw_props(&mut self, props: &DrawProps<'_>) {
+        self.ctx.set_transform(props.transform);
+        self.apply_soft_mask(props.soft_mask.as_ref());
+        self.ctx
+            .set_blend_mode(convert_blend_mode(props.blend_mode));
+    }
+
+    fn apply_image_props(&mut self, props: &ImageDrawProps<'_>) {
+        self.ctx.set_transform(props.transform);
+        self.apply_soft_mask(props.soft_mask.as_ref());
+        self.ctx
+            .set_blend_mode(convert_blend_mode(props.blend_mode));
+    }
+}
+
+impl<'a, 'r> Device<'a> for Renderer<'r> {
+    fn draw_image(&mut self, image: hayro_interpret::Image<'a, '_>, props: ImageDrawProps<'a>) {
+        Self::draw_pdf_image(self, image, props);
+    }
+
+    fn push_clip_path(&mut self, clip_path: &ClipPath) {
+        Self::push_clip_path(self, clip_path);
+    }
+
+    fn push_clip_rect(&mut self, rect: &Rect) {
+        Self::push_clip_rect(self, rect);
+    }
+
+    fn push_transparency_group(
+        &mut self,
+        opacity: f32,
+        mask: Option<SoftMask<'a>>,
+        blend_mode: BlendMode,
+    ) {
+        Self::push_transparency_group(self, opacity, mask, blend_mode);
+    }
+
+    fn pop_clip(&mut self) {
+        Self::pop_clip(self);
+    }
+
+    fn pop_transparency_group(&mut self) {
+        Self::pop_transparency_group(self);
+    }
+
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        Self::draw_path(self, path, props, draw_mode);
+    }
+
+    fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        Self::draw_rect(self, rect, props, draw_mode);
+    }
+
+    fn draw_glyph_run(
+        &mut self,
+        glyph_run: &GlyphRun<'_, 'a>,
+        props: DrawProps<'a>,
+        draw_mode: &DrawMode,
+    ) {
+        Self::draw_glyph_run(self, glyph_run, props, draw_mode);
+    }
+}
+
+/// A cache used by the renderer.
+///
+/// Ideally, such a cache should be constructed once per PDF and then reused across
+/// multiple render invocations on the same document.
+#[derive(Clone, Default)]
+pub struct RenderCache<'a> {
+    pub(crate) interpreter_cache: InterpreterCache<'a>,
+    pub(crate) outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+}
+
+impl<'a> RenderCache<'a> {
+    /// Create a new render cache.
+    pub fn new() -> Self {
+        Self {
+            interpreter_cache: InterpreterCache::new(),
+            outline_cache: Rc::new(RefCell::new(FxHashMap::default())),
+        }
+    }
+}
 
 /// Settings to apply during rendering.
 #[derive(Clone, Copy)]
@@ -88,16 +232,17 @@ impl Default for RenderSettings {
 }
 
 /// Render the page with the given settings to a pixmap.
-pub fn render(
-    page: &Page<'_>,
+pub fn render<'a>(
+    page: &'a Page<'a>,
+    cache: &RenderCache<'a>,
     interpreter_settings: &InterpreterSettings,
     render_settings: &RenderSettings,
 ) -> Pixmap {
     let (x_scale, y_scale) = (render_settings.x_scale, render_settings.y_scale);
     let (width, height) = page.render_dimensions();
     let (scaled_width, scaled_height) = ((width * x_scale) as f64, (height * y_scale) as f64);
-    let initial_transform =
-        Affine::scale_non_uniform(x_scale as f64, y_scale as f64) * page.initial_transform(true);
+    let initial_transform = Affine::scale_non_uniform(x_scale as f64, y_scale as f64)
+        * page.initial_transform(true).to_kurbo();
 
     let (pix_width, pix_height) = (
         render_settings.width.unwrap_or(scaled_width.floor() as u16),
@@ -108,17 +253,18 @@ pub fn render(
     let mut state = Context::new(
         initial_transform,
         Rect::new(0.0, 0.0, pix_width as f64, pix_height as f64),
+        &cache.interpreter_cache,
         page.xref(),
         interpreter_settings.clone(),
     );
 
     let vc_settings = vello_cpu::RenderSettings {
-        level: Level::new(),
+        level: vello_cpu::Level::new(),
         num_threads: 0,
-        render_mode: RenderMode::OptimizeSpeed,
     };
 
-    let mut device = Renderer::new(pix_width, pix_height, vc_settings);
+    let global = GlobalState::new(cache);
+    let mut device = Renderer::new(pix_width, pix_height, vc_settings, &global);
 
     device.ctx.set_paint(render_settings.bg_color);
     device
@@ -136,10 +282,11 @@ pub fn render(
 
     device.pop_transparency_group();
 
-    device.pop_clip_path();
+    device.pop_clip();
 
     let mut pixmap = Pixmap::new(pix_width, pix_height);
-    device.ctx.render_to_pixmap(&mut pixmap);
+    let mut resources = vello_cpu::Resources::default();
+    device.ctx.render(&mut pixmap, &mut resources);
 
     pixmap
 }
@@ -152,6 +299,7 @@ pub fn render_pdf(
     settings: InterpreterSettings,
     range: Option<RangeInclusive<usize>>,
 ) -> Option<Vec<Pixmap>> {
+    let cache = RenderCache::new();
     let rendered = pdf
         .pages()
         .iter()
@@ -163,6 +311,7 @@ pub fn render_pdf(
 
             let pixmap = render(
                 page,
+                &cache,
                 &settings,
                 &RenderSettings {
                     x_scale: scale,
@@ -184,4 +333,34 @@ pub(crate) fn derive_settings(settings: &vello_cpu::RenderSettings) -> vello_cpu
         num_threads: 0,
         ..*settings
     }
+}
+
+fn convert_fill_rule(fill_rule: FillRule) -> Fill {
+    match fill_rule {
+        FillRule::NonZero => Fill::NonZero,
+        FillRule::EvenOdd => Fill::EvenOdd,
+    }
+}
+
+fn convert_blend_mode(blend_mode: BlendMode) -> peniko::BlendMode {
+    let mix = match blend_mode {
+        BlendMode::Normal => Mix::Normal,
+        BlendMode::Multiply => Mix::Multiply,
+        BlendMode::Screen => Mix::Screen,
+        BlendMode::Overlay => Mix::Overlay,
+        BlendMode::Darken => Mix::Darken,
+        BlendMode::Lighten => Mix::Lighten,
+        BlendMode::ColorDodge => Mix::ColorDodge,
+        BlendMode::ColorBurn => Mix::ColorBurn,
+        BlendMode::HardLight => Mix::HardLight,
+        BlendMode::SoftLight => Mix::SoftLight,
+        BlendMode::Difference => Mix::Difference,
+        BlendMode::Exclusion => Mix::Exclusion,
+        BlendMode::Hue => Mix::Hue,
+        BlendMode::Saturation => Mix::Saturation,
+        BlendMode::Color => Mix::Color,
+        BlendMode::Luminosity => Mix::Luminosity,
+    };
+
+    peniko::BlendMode::new(mix, Compose::SrcOver)
 }

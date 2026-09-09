@@ -1,10 +1,10 @@
 //! Building and setting up decompositions, sub-bands, precincts and code-blocks.
 
-use super::decode::{DecompositionStorage, TileDecodeContext, TileDecompositions};
+use super::decode::{DecompositionStorage, TileDecompositions};
 use super::rect::IntRect;
 use super::tag_tree::TagTree;
 use super::tile::{ResolutionTile, Tile};
-use crate::error::{DecodingError, Result};
+use crate::error::{DecodingError, Result, ValidationError};
 use alloc::vec;
 use core::iter;
 use core::ops::Range;
@@ -13,22 +13,28 @@ use core::ops::Range;
 /// for a specific tile. Also parses the segments for each code-block.
 pub(crate) fn build(
     tile: &Tile<'_>,
-    tile_ctx: &mut TileDecodeContext<'_>,
     storage: &mut DecompositionStorage<'_>,
+    skipped_resolution_levels: u8,
 ) -> Result<()> {
-    build_decompositions(tile, tile_ctx, storage)
+    build_decompositions(tile, storage, skipped_resolution_levels)
 }
 
 fn build_decompositions(
     tile: &Tile<'_>,
-    tile_ctx: &mut TileDecodeContext<'_>,
     storage: &mut DecompositionStorage<'_>,
+    skipped_resolution_levels: u8,
 ) -> Result<()> {
-    let mut total_coefficients = 0;
+    let mut total_coefficients = 0_usize;
 
     for component_tile in tile.component_tiles() {
-        total_coefficients +=
-            component_tile.rect.width() as usize * component_tile.rect.height() as usize;
+        let decoded_resolutions =
+            component_tile.component_info.num_resolution_levels() - skipped_resolution_levels;
+        let top_resolution = ResolutionTile::new(component_tile, decoded_resolutions - 1);
+        let component_samples = usize::try_from(top_resolution.rect.area())
+            .map_err(|_| ValidationError::ImageTooLarge)?;
+        total_coefficients = total_coefficients
+            .checked_add(component_samples)
+            .ok_or(ValidationError::ImageTooLarge)?;
     }
 
     if storage.coefficients.is_empty() {
@@ -37,9 +43,11 @@ fn build_decompositions(
     } else {
         storage.coefficients.resize(total_coefficients, 0.0);
     }
-    let mut coefficient_counter = 0;
+    let mut coefficient_counter = 0_usize;
 
     for (component_idx, component_tile) in tile.component_tiles().enumerate() {
+        let decoded_resolutions =
+            component_tile.component_info.num_resolution_levels() - skipped_resolution_levels;
         let d_start = storage.decompositions.len();
         let mut resolution_tiles = component_tile.resolution_tiles();
 
@@ -49,13 +57,11 @@ fn build_decompositions(
          -> Result<usize> {
             let sub_band_rect = resolution_tile.sub_band_rect(sub_band_type);
 
-            ltrace!(
+            trace!(
                 "r {} making sub-band {} for component {}",
-                resolution_tile.resolution,
-                sub_band_type as u8,
-                component_idx
+                resolution_tile.resolution, sub_band_type as u8, component_idx
             );
-            ltrace!(
+            trace!(
                 "Sub-band rect: [{},{} {}x{}], ll rect [{},{} {}x{}]",
                 sub_band_rect.x0,
                 sub_band_rect.y0,
@@ -67,11 +73,19 @@ fn build_decompositions(
                 resolution_tile.rect.height(),
             );
 
-            let precincts = build_precincts(resolution_tile, sub_band_rect, tile_ctx, storage)?;
+            let precincts = build_precincts(resolution_tile, sub_band_rect, tile, storage)?;
 
-            let added_coefficients = (sub_band_rect.width() * sub_band_rect.height()) as usize;
-            let coefficients = coefficient_counter..(coefficient_counter + added_coefficients);
-            coefficient_counter += added_coefficients;
+            // No need to allocate coefficients for skipped resolution levels.
+            let added_coefficients = if resolution_tile.resolution < decoded_resolutions {
+                usize::try_from(sub_band_rect.area()).map_err(|_| ValidationError::ImageTooLarge)?
+            } else {
+                0
+            };
+            let next_coefficient_counter = coefficient_counter
+                .checked_add(added_coefficients)
+                .ok_or(ValidationError::ImageTooLarge)?;
+            let coefficients = coefficient_counter..next_coefficient_counter;
+            coefficient_counter = next_coefficient_counter;
 
             let idx = storage.sub_bands.len();
             storage.sub_bands.push(SubBand {
@@ -117,7 +131,7 @@ fn build_decompositions(
 fn build_precincts(
     resolution_tile: &ResolutionTile<'_>,
     sub_band_rect: IntRect,
-    tile_ctx: &mut TileDecodeContext<'_>,
+    tile: &Tile<'_>,
     storage: &mut DecompositionStorage<'_>,
 ) -> Result<Range<usize>> {
     let start = storage.precincts.len();
@@ -155,7 +169,7 @@ fn build_precincts(
             code_block_area.height() / cb_height
         };
 
-        ltrace!(
+        trace!(
             "Precinct rect: [{},{} {}x{}], num_code_blocks_wide: {}, num_code_blocks_high: {}",
             precinct_rect.x0,
             precinct_rect.y0,
@@ -171,7 +185,7 @@ fn build_precincts(
             resolution_tile,
             code_blocks_x,
             code_blocks_y,
-            tile_ctx,
+            tile,
             storage,
         );
 
@@ -198,7 +212,7 @@ fn build_code_blocks(
     tile_instance: &ResolutionTile<'_>,
     code_blocks_x: u32,
     code_blocks_y: u32,
-    tile_ctx: &mut TileDecodeContext<'_>,
+    tile: &Tile<'_>,
     storage: &mut DecompositionStorage<'_>,
 ) -> Range<usize> {
     let mut y = code_block_area.y0;
@@ -219,7 +233,7 @@ fn build_code_blocks(
             let area = IntRect::from_xywh(x, y, code_block_width, code_block_height)
                 .intersect(sub_band_rect);
 
-            ltrace!(
+            trace!(
                 "Codeblock rect: [{},{} {}x{}]",
                 area.x0,
                 area.y0,
@@ -234,7 +248,7 @@ fn build_code_blocks(
                     // layer segments.
                     segments: None,
                 },
-                tile_ctx.tile.num_layers as usize,
+                tile.num_layers as usize,
             ));
             let end = storage.layers.len();
 

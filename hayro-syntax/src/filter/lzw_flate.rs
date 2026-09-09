@@ -1,17 +1,17 @@
 use crate::bit_reader::{BitChunk, BitChunks, BitReader, BitWriter, bit_mask};
+use crate::filter::png::{self, BytesPerPixel, RowFilter};
 use crate::object::Dict;
 use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, EARLY_CHANGE, PREDICTOR};
 use alloc::vec;
 use alloc::vec::Vec;
-use log::warn;
 
 pub(crate) mod flate {
     use super::*;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
     use crate::object::Dict;
 
-    #[cfg(feature = "std")]
-    pub(crate) fn decode(data: &[u8], params: Dict<'_>) -> Option<Vec<u8>> {
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
         use flate2::read::{DeflateDecoder, ZlibDecoder};
         use std::io::Read;
 
@@ -34,14 +34,14 @@ pub(crate) mod flate {
 
                 fallback::decode(data)
             })?;
-        let params = PredictorParams::from_params(&params);
+        let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params)
     }
 
-    #[cfg(not(feature = "std"))]
-    pub(crate) fn decode(data: &[u8], params: Dict<'_>) -> Option<Vec<u8>> {
+    #[cfg(not(feature = "unsafe"))]
+    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
         let decoded = fallback::decode(data)?;
-        let params = PredictorParams::from_params(&params);
+        let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params)
     }
 
@@ -50,7 +50,6 @@ pub(crate) mod flate {
     mod fallback {
         use alloc::vec;
         use alloc::vec::Vec;
-        use log::warn;
 
         pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
             flate_decode(data)
@@ -569,11 +568,10 @@ pub(crate) mod lzw {
     use crate::object::Dict;
     use alloc::vec;
     use alloc::vec::Vec;
-    use log::warn;
 
     /// Decode a LZW-encoded stream.
-    pub(crate) fn decode(data: &[u8], params: Dict<'_>) -> Option<Vec<u8>> {
-        let params = PredictorParams::from_params(&params);
+    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
+        let params = PredictorParams::from_params(params);
 
         let decoded = decode_impl(data, params.early_change)?;
 
@@ -783,6 +781,21 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
             } else {
                 (params.bits_per_component, params.colors as usize)
             };
+
+            if bit_size == 8
+                && let Some(tbpp) = BytesPerPixel::from_row_len(row_len, chunk_len)
+            {
+                return apply_predictor_8bit_png(
+                    data,
+                    i,
+                    is_png_predictor,
+                    row_len,
+                    total_row_len,
+                    num_rows,
+                    tbpp,
+                );
+            }
+
             let zero_row = vec![0; row_len];
             let mut prev_row = BitChunks::new(&zero_row, bit_size, chunk_len)?;
             let zero_col = BitChunk::new(0, chunk_len);
@@ -865,6 +878,61 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
             Some(out)
         }
     }
+}
+
+fn apply_predictor_8bit_png(
+    mut data: Vec<u8>,
+    predictor: u8,
+    is_png_predictor: bool,
+    row_len: usize,
+    total_row_len: usize,
+    num_rows: usize,
+    tbpp: BytesPerPixel,
+) -> Option<Vec<u8>> {
+    if row_len == 0 || total_row_len == 0 {
+        return None;
+    }
+
+    let out_len = num_rows * row_len;
+
+    for row_idx in 0..num_rows {
+        let src_start = row_idx * total_row_len;
+        let dst_start = row_idx * row_len;
+
+        if is_png_predictor {
+            let predictor = data[src_start];
+            data.copy_within(src_start + 1..src_start + 1 + row_len, dst_start);
+
+            let (done, rest) = data.split_at_mut(dst_start);
+            let prev_row = if let Some(prev_start) = done.len().checked_sub(row_len) {
+                &done[prev_start..]
+            } else {
+                &[]
+            };
+            let row = &mut rest[..row_len];
+
+            if let Some(filter) = RowFilter::from_u8(predictor) {
+                png::unfilter(filter, tbpp, prev_row, row);
+            }
+        } else if predictor == 2 {
+            let (done, rest) = data.split_at_mut(dst_start);
+            let prev_row = if let Some(prev_start) = done.len().checked_sub(row_len) {
+                &done[prev_start..]
+            } else {
+                &[]
+            };
+            let row = &mut rest[..row_len];
+            png::unfilter(RowFilter::Sub, tbpp, prev_row, row);
+        } else {
+            warn!("unknown predictor {predictor}");
+
+            return None;
+        }
+    }
+
+    data.truncate(out_len);
+
+    Some(data)
 }
 
 fn apply<'a, T: Predictor>(
@@ -965,7 +1033,7 @@ mod tests {
     #[test]
     fn decode_lzw() {
         let input = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
-        let decoded = lzw::decode(&input, Dict::default()).unwrap();
+        let decoded = lzw::decode(&input, &Dict::default()).unwrap();
 
         assert_eq!(decoded, vec![45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
     }
@@ -976,7 +1044,7 @@ mod tests {
             0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0, 0x5, 0x8c, 0x1, 0xf5,
         ];
 
-        let decoded = flate::decode(&input, Dict::default()).unwrap();
+        let decoded = flate::decode(&input, &Dict::default()).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -984,7 +1052,7 @@ mod tests {
     fn decode_flate() {
         let input = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0];
 
-        let decoded = flate::decode(&input, Dict::default()).unwrap();
+        let decoded = flate::decode(&input, &Dict::default()).unwrap();
         assert_eq!(decoded, b"Hello");
     }
     

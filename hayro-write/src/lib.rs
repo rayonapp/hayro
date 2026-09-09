@@ -8,12 +8,14 @@ well-documented.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[macro_use]
+mod log;
+
 mod primitive;
 
 use crate::primitive::{WriteDirect, WriteIndirect};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use hayro_syntax::Pdf;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Object;
 use hayro_syntax::object::dict::keys::{
@@ -21,23 +23,25 @@ use hayro_syntax::object::dict::keys::{
 };
 use hayro_syntax::object::{MaybeRef, ObjRef};
 use hayro_syntax::page::{Page, Resources, Rotation};
-use kurbo::Affine;
-use log::warn;
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Deref;
 use std::ops::DerefMut;
 
 pub use hayro_syntax;
+use hayro_syntax::Pdf;
+pub use pdf_writer::Settings as ChunkSettings;
 
 /// Apply the extraction queries to the given PDF and return the results.
 pub fn extract<'a>(
     pdf: &Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
+    chunk_settings: ChunkSettings,
     queries: &[ExtractionQuery],
 ) -> Result<ExtractionResult, ExtractionError> {
     let pages = pdf.pages();
-    let mut ctx = ExtractionContext::new(new_ref, pdf);
+    let mut ctx = ExtractionContext::new(new_ref, pdf, chunk_settings);
 
     for query in queries {
         let page = pages
@@ -58,7 +62,7 @@ pub fn extract<'a>(
     // any anymore.
     write_dependencies(pdf, &mut ctx);
 
-    let mut global_chunk = Chunk::new();
+    let mut global_chunk = Chunk::with_settings(chunk_settings);
 
     for chunk in &ctx.chunks {
         global_chunk.extend(chunk);
@@ -127,29 +131,35 @@ struct ExtractionContext<'a> {
     chunks: Vec<Chunk>,
     visited_objects: HashSet<ObjRef>,
     to_visit_refs: Vec<ObjRef>,
-    valid_ref_cache: HashMap<ObjRef, bool>,
+    valid_ref_cache: FxHashMap<ObjRef, bool>,
     root_refs: Vec<Result<Ref, ExtractionError>>,
     pdf: &'a Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
-    ref_map: HashMap<ObjRef, Ref>,
-    cached_content_streams: HashMap<usize, Ref>,
+    ref_map: FxHashMap<ObjRef, Ref>,
+    cached_content_streams: FxHashMap<usize, Ref>,
     page_tree_parent_ref: Ref,
+    chunk_settings: ChunkSettings,
 }
 
 impl<'a> ExtractionContext<'a> {
-    fn new(mut new_ref: Box<dyn FnMut() -> Ref + 'a>, pdf: &'a Pdf) -> Self {
+    fn new(
+        mut new_ref: Box<dyn FnMut() -> Ref + 'a>,
+        pdf: &'a Pdf,
+        chunk_settings: ChunkSettings,
+    ) -> Self {
         let page_tree_parent_ref = new_ref();
         Self {
             chunks: vec![],
             visited_objects: HashSet::new(),
             to_visit_refs: Vec::new(),
-            valid_ref_cache: HashMap::new(),
+            valid_ref_cache: FxHashMap::default(),
             pdf,
             new_ref,
-            ref_map: HashMap::new(),
-            cached_content_streams: HashMap::new(),
+            ref_map: FxHashMap::default(),
+            cached_content_streams: FxHashMap::default(),
             root_refs: Vec::new(),
             page_tree_parent_ref,
+            chunk_settings,
         }
     }
 
@@ -176,7 +186,7 @@ fn write_dependencies(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) {
             continue;
         }
 
-        let mut chunk = Chunk::new();
+        let mut chunk = Chunk::with_settings(ctx.chunk_settings);
         if let Some(object) = pdf.xref().get::<Object<'_>>(ref_.into()) {
             let new_ref = ctx.map_ref(ref_);
             object.write_indirect(&mut chunk, new_ref, ctx);
@@ -205,7 +215,13 @@ pub fn extract_pages_to_pdf(hayro_pdf: &Pdf, page_indices: &[usize]) -> Vec<u8> 
 
     let catalog_id = next_ref.bump();
 
-    let extracted = extract(hayro_pdf, Box::new(|| next_ref.bump()), &requests).unwrap();
+    let extracted = extract(
+        hayro_pdf,
+        Box::new(|| next_ref.bump()),
+        ChunkSettings::default(),
+        &requests,
+    )
+    .unwrap();
     pdf.catalog(catalog_id)
         .pages(extracted.page_tree_parent_ref);
     let count = extracted.root_refs.len();
@@ -236,7 +252,13 @@ pub fn extract_pages_as_xobject_to_pdf(hayro_pdf: &Pdf, page_indices: &[usize]) 
         })
         .collect::<Vec<_>>();
 
-    let extracted = extract(hayro_pdf, Box::new(|| next_ref.bump()), &requests).unwrap();
+    let extracted = extract(
+        hayro_pdf,
+        Box::new(|| next_ref.bump()),
+        ChunkSettings::default(),
+        &requests,
+    )
+    .unwrap();
 
     pdf.catalog(catalog_id)
         .pages(extracted.page_tree_parent_ref);
@@ -287,7 +309,7 @@ fn write_page(
     page_idx: usize,
     ctx: &mut ExtractionContext<'_>,
 ) -> Result<(), ExtractionError> {
-    let mut chunk = Chunk::new();
+    let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     // Note: We can cache content stream references, but _not_ the page references themselves.
     // Acrobat for some reason doesn't like duplicate page references in the page tree.
     let stream_ref = if let Some(cached) = ctx.cached_content_streams.get(&page_idx) {
@@ -340,7 +362,7 @@ fn write_xobject(
     xobj_ref: Ref,
     ctx: &mut ExtractionContext<'_>,
 ) -> Result<(), ExtractionError> {
-    let mut chunk = Chunk::new();
+    let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     let encoded_stream = deflate_encode(page.page_stream().unwrap_or(b""));
     let mut x_object = chunk.form_xobject(xobj_ref, &encoded_stream);
     x_object.deref_mut().filter(Filter::FlateDecode);
@@ -367,6 +389,12 @@ fn write_xobject(
 
     serialize_resources(page.resources(), ctx, &mut x_object);
 
+    let raw_dict = page.raw();
+
+    if let Some(group) = raw_dict.get_raw::<Object<'_>>(GROUP) {
+        group.write_direct(x_object.insert(Name(GROUP)), ctx);
+    }
+
     x_object.finish();
     ctx.chunks.push(chunk);
 
@@ -386,42 +414,35 @@ fn serialize_resources(
     let fonts = collect_resources(resources, |r| r.fonts.clone());
     let properties = collect_resources(resources, |r| r.properties.clone());
 
-    if !(ext_g_states.is_empty()
-        && shadings.is_empty()
-        && patterns.is_empty()
-        && x_objects.is_empty()
-        && color_spaces.is_empty()
-        && properties.is_empty()
-        && fonts.is_empty())
-    {
-        let mut resources = writer.resources();
+    // Resource dictionary is always required (unless it can be inherited), so
+    // let's just be safe and always write it.
+    let mut resources = writer.resources();
 
-        macro_rules! write {
-            ($name:ident, $key:expr) => {
-                if !$name.is_empty() {
-                    let mut dict = resources.insert(Name($key)).dict();
+    macro_rules! write {
+        ($name:ident, $key:expr) => {
+            if !$name.is_empty() {
+                let mut dict = resources.insert(Name($key)).dict();
 
-                    for (name, obj) in $name {
-                        obj.write_direct(dict.insert(Name(name.deref())), ctx);
-                    }
+                for (name, obj) in $name {
+                    obj.write_direct(dict.insert(Name(name.deref())), ctx);
                 }
-            };
-        }
-
-        write!(ext_g_states, EXT_G_STATE);
-        write!(shadings, SHADING);
-        write!(patterns, PATTERN);
-        write!(x_objects, XOBJECT);
-        write!(color_spaces, COLORSPACE);
-        write!(fonts, FONT);
-        write!(properties, PROPERTIES);
+            }
+        };
     }
+
+    write!(ext_g_states, EXT_G_STATE);
+    write!(shadings, SHADING);
+    write!(patterns, PATTERN);
+    write!(x_objects, XOBJECT);
+    write!(color_spaces, COLORSPACE);
+    write!(fonts, FONT);
+    write!(properties, PROPERTIES);
 }
 
 fn collect_resources<'a>(
     resources: &Resources<'a>,
     get_dict: impl FnMut(&Resources<'a>) -> Dict<'a> + Clone,
-) -> BTreeMap<hayro_syntax::object::Name, MaybeRef<Object<'a>>> {
+) -> BTreeMap<hayro_syntax::object::Name<'a>, MaybeRef<Object<'a>>> {
     let mut map = BTreeMap::new();
     collect_resources_inner(resources, get_dict, &mut map);
     map
@@ -430,7 +451,7 @@ fn collect_resources<'a>(
 fn collect_resources_inner<'a>(
     resources: &Resources<'a>,
     mut get_dict: impl FnMut(&Resources<'a>) -> Dict<'a> + Clone,
-    map: &mut BTreeMap<hayro_syntax::object::Name, MaybeRef<Object<'a>>>,
+    map: &mut BTreeMap<hayro_syntax::object::Name<'a>, MaybeRef<Object<'a>>>,
 ) {
     // Process parents first, so that duplicates get overridden by the current dictionary.
     // Since for inheritance, the current dictionary always has priority over entries in the
@@ -477,55 +498,5 @@ impl ResourcesExt for pdf_writer::writers::Page<'_> {
 impl ResourcesExt for pdf_writer::writers::FormXObject<'_> {
     fn resources(&mut self) -> pdf_writer::writers::Resources<'_> {
         Self::resources(self)
-    }
-}
-
-// Note: Keep in sync with `hayro-interpret`.
-trait PageExt {
-    /// Return the initial transform that should be applied when rendering. This accounts for a
-    /// number of factors, such as the mismatch between PDF's y-up and most renderers' y-down
-    /// coordinate system, the rotation of the page and the offset of the crop box.
-    fn initial_transform(&self, invert_y: bool) -> Affine;
-}
-
-impl PageExt for Page<'_> {
-    fn initial_transform(&self, invert_y: bool) -> Affine {
-        let crop_box = self.intersected_crop_box();
-        let (_, base_height) = self.base_dimensions();
-        let (width, height) = self.render_dimensions();
-
-        let horizontal_t =
-            Affine::rotate(90.0_f64.to_radians()) * Affine::translate((0.0, -width as f64));
-        let flipped_horizontal_t =
-            Affine::translate((0.0, height as f64)) * Affine::rotate(-90.0_f64.to_radians());
-
-        let rotation_transform = match self.rotation() {
-            Rotation::None => Affine::IDENTITY,
-            Rotation::Horizontal => {
-                if invert_y {
-                    horizontal_t
-                } else {
-                    flipped_horizontal_t
-                }
-            }
-            Rotation::Flipped => {
-                Affine::scale(-1.0) * Affine::translate((-width as f64, -height as f64))
-            }
-            Rotation::FlippedHorizontal => {
-                if invert_y {
-                    flipped_horizontal_t
-                } else {
-                    horizontal_t
-                }
-            }
-        };
-
-        let inversion_transform = if invert_y {
-            Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, base_height as f64])
-        } else {
-            Affine::IDENTITY
-        };
-
-        rotation_transform * inversion_transform * Affine::translate((-crop_box.x0, -crop_box.y0))
     }
 }

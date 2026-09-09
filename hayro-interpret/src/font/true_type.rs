@@ -15,13 +15,12 @@ use hayro_syntax::object::Object;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
 use kurbo::BezPath;
-use log::warn;
+use rustc_hash::FxHashMap;
 use skrifa::attribute::Style;
 use skrifa::raw::TableProvider;
 use skrifa::raw::tables::cmap::PlatformId;
-use skrifa::{GlyphId, GlyphId16, MetadataProvider};
+use skrifa::{GlyphId, MetadataProvider};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -211,13 +210,13 @@ struct EmbeddedKind {
     widths: Vec<Width>,
     missing_width: f32,
     font_flags: Option<FontFlags>,
-    glyph_names: HashMap<String, GlyphId>,
+    glyph_names: FxHashMap<String, GlyphId>,
     encoding: Encoding,
     // Only used for PDFs that mistakenly embed a
     // CFF font.
     cff_blob: Option<CffFontBlob>,
-    differences: HashMap<u8, String>,
-    cached_mappings: RefCell<HashMap<u8, GlyphId>>,
+    differences: FxHashMap<u8, String>,
+    cached_mappings: RefCell<FxHashMap<u8, GlyphId>>,
     /// PostScript name from the PDF.
     postscript_name: Option<String>,
 }
@@ -235,16 +234,7 @@ impl EmbeddedKind {
             .and_then(|s| s.decoded().ok())
             .and_then(|d| OpenTypeFontBlob::new(Arc::new(d.to_vec()), 0))?;
 
-        let mut glyph_names = HashMap::new();
-
-        // TODO: This is still pretty slow, see test file `font_truetype_slow_post_lookup`.
-        if let Ok(post) = base_font.font_ref().post() {
-            for i in 0..base_font.num_glyphs() {
-                if let Some(str) = post.glyph_name(GlyphId16::new(i)) {
-                    glyph_names.insert(str.to_string(), GlyphId::new(i as u32));
-                }
-            }
-        }
+        let glyph_names = base_font.glyph_names();
 
         let cff_font_blob = base_font
             .font_ref()
@@ -253,7 +243,7 @@ impl EmbeddedKind {
             .and_then(|cff| CffFontBlob::new(Arc::new(cff.offset_data().as_ref().to_vec())));
 
         let postscript_name = dict
-            .get::<Name>(BASE_FONT)
+            .get::<Name<'_>>(BASE_FONT)
             .map(|n| strip_subset_prefix(n.as_str()).to_string());
 
         Some(Self {
@@ -265,7 +255,7 @@ impl EmbeddedKind {
             glyph_names,
             font_flags,
             encoding,
-            cached_mappings: RefCell::new(HashMap::new()),
+            cached_mappings: RefCell::new(FxHashMap::default()),
             postscript_name,
         })
     }
@@ -297,12 +287,9 @@ impl EmbeddedKind {
         }
 
         if let Some(blob) = self.cff_blob.as_ref() {
-            let table = blob.table();
-
             return self
                 .code_to_name(code)
-                .and_then(|name| table.glyph_index_by_name(name))
-                .map(|g| GlyphId::new(g.0 as u32))
+                .and_then(|name| blob.glyph_index_by_name(name))
                 .unwrap_or(GlyphId::NOTDEF);
         }
 
@@ -444,46 +431,56 @@ impl CacheKey for TrueTypeFont {
     }
 }
 
-pub(crate) fn read_encoding(dict: &Dict<'_>) -> (Encoding, HashMap<u8, String>) {
-    fn get_encoding_base(dict: &Dict<'_>, name: Name) -> Encoding {
-        match dict.get::<Name>(name.clone()) {
+pub(crate) fn read_encoding(dict: &Dict<'_>) -> (Encoding, FxHashMap<u8, String>) {
+    fn get_encoding_base(dict: &Dict<'_>, name: Name<'_>) -> Encoding {
+        match dict.get::<Name<'_>>(name.as_ref()) {
             Some(n) => match n.deref() {
                 WIN_ANSI_ENCODING => Encoding::WinAnsi,
                 MAC_ROMAN_ENCODING => Encoding::MacRoman,
                 MAC_EXPERT_ENCODING => Encoding::MacExpert,
+                STANDARD_ENCODING => Encoding::Standard,
                 _ => {
                     warn!("Unknown font encoding {}", name.as_str());
 
-                    Encoding::Standard
+                    Encoding::BuiltIn
                 }
             },
             None => Encoding::BuiltIn,
         }
     }
 
-    let mut map = HashMap::new();
+    let mut map = FxHashMap::default();
 
     if let Some(encoding_dict) = dict.get::<Dict<'_>>(ENCODING) {
         if let Some(differences) = encoding_dict.get::<Array<'_>>(DIFFERENCES) {
             let entries = differences.iter::<Object<'_>>();
 
-            let mut code = 0;
+            let mut code = 0_i64;
 
             for obj in entries {
-                if let Some(num) = obj.clone().into_i32() {
-                    code = num;
-                } else if let Some(name) = obj.into_name() {
-                    map.insert(code as u8, name.as_str().to_string());
-                    code += 1;
+                match obj {
+                    Object::Number(num) => {
+                        code = num.as_i64();
+                    }
+                    Object::Name(name) => {
+                        if let Ok(code) = code.try_into() {
+                            map.insert(code, name.as_str().to_string());
+                        }
+                        code += 1;
+                    }
+                    _ => {}
                 }
             }
         }
 
         (
-            get_encoding_base(&encoding_dict, Name::new(BASE_ENCODING)),
+            get_encoding_base(&encoding_dict, Name::new_unescaped(BASE_ENCODING)),
             map,
         )
     } else {
-        (get_encoding_base(dict, Name::new(ENCODING)), HashMap::new())
+        (
+            get_encoding_base(dict, Name::new_unescaped(ENCODING)),
+            FxHashMap::default(),
+        )
     }
 }

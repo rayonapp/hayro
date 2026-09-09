@@ -1,11 +1,12 @@
 use crate::clip::CachedClipPath;
 use crate::{Id, hash128};
 use crate::{SvgRenderer, convert_transform};
-use hayro_interpret::encode::EncodedShadingPattern;
+use hayro_interpret::encode::EncodedShadingType;
+use hayro_interpret::gradient::{SvgGradient, SvgGradientKind};
 use hayro_interpret::pattern::{Pattern, ShadingPattern, TilingPattern};
 use hayro_interpret::{CacheKey, FillRule, Paint, StrokeProps};
 use image::{DynamicImage, ImageBuffer};
-use kurbo::{Affine, BezPath, Point, Rect, Shape, Vec2};
+use kurbo::{Affine, Rect, Shape};
 
 #[derive(Clone)]
 pub(crate) struct CachedTilingPattern<'a> {
@@ -15,9 +16,18 @@ pub(crate) struct CachedTilingPattern<'a> {
 
 pub(crate) struct CachedShadingPattern {
     pub(crate) transform: Affine,
-    pub(crate) shading: Id,
+    pub(crate) paint: CachedShadingPaint,
     pub(crate) clip_path: Option<Id>,
     pub(crate) bbox: Rect,
+}
+
+pub(crate) enum CachedShadingPaint {
+    Raster { shading: Id },
+    NativeGradient { gradient: Id },
+}
+
+pub(crate) struct CachedNativeGradient {
+    pub(crate) gradient: SvgGradient,
 }
 
 pub(crate) struct CachedShading {
@@ -29,13 +39,58 @@ impl<'a> SvgRenderer<'a> {
     pub(crate) fn write_paint(
         &mut self,
         paint: &Paint<'a>,
-        path: &BezPath,
+        path_bbox: impl Fn() -> Rect,
         path_transform: Affine,
         stroke_props: Option<&StrokeProps>,
     ) {
-        let is_stroke = stroke_props.is_some();
+        let (paint_str, alpha) = self.svg_paint(paint, &path_bbox, path_transform, stroke_props);
 
-        let (paint_str, alpha) = match &paint {
+        if stroke_props.is_some() {
+            self.xml.write_attribute("fill", "none");
+            self.xml.write_attribute("stroke", &paint_str);
+            if alpha != 1.0 {
+                self.xml.write_attribute("stroke-opacity", &alpha);
+            }
+        } else {
+            self.xml.write_attribute("fill", &paint_str);
+
+            if alpha != 1.0 {
+                self.xml.write_attribute("fill-opacity", &alpha);
+            }
+        }
+    }
+
+    pub(crate) fn write_fill_and_stroke_paint(
+        &mut self,
+        paint: &Paint<'a>,
+        path_bbox: impl Fn() -> Rect,
+        path_transform: Affine,
+        stroke_props: &StrokeProps,
+    ) {
+        let (fill_str, fill_alpha) = self.svg_paint(paint, &path_bbox, path_transform, None);
+        let (stroke_str, stroke_alpha) =
+            self.svg_paint(paint, &path_bbox, path_transform, Some(stroke_props));
+
+        self.xml.write_attribute("fill", &fill_str);
+        self.xml.write_attribute("stroke", &stroke_str);
+
+        if fill_alpha != 1.0 {
+            self.xml.write_attribute("fill-opacity", &fill_alpha);
+        }
+
+        if stroke_alpha != 1.0 {
+            self.xml.write_attribute("stroke-opacity", &stroke_alpha);
+        }
+    }
+
+    fn svg_paint(
+        &mut self,
+        paint: &Paint<'a>,
+        path_bbox: &impl Fn() -> Rect,
+        path_transform: Affine,
+        stroke_props: Option<&StrokeProps>,
+    ) -> (String, f32) {
+        match &paint {
             Paint::Color(c) => {
                 let rgba8 = c.to_rgba().to_rgba8();
                 let color = format!(
@@ -52,7 +107,9 @@ impl<'a> SvgRenderer<'a> {
             Paint::Pattern(p) => {
                 let id = match p.as_ref() {
                     Pattern::Shading(s) => {
-                        let mut basic_bbox = path.bounding_box();
+                        const NATIVE_GRADIENT_TOLERANCE: f32 = 0.01;
+
+                        let mut basic_bbox = path_bbox();
 
                         if let Some(stroke_width) = stroke_props.map(|s| s.line_width) {
                             basic_bbox =
@@ -68,17 +125,39 @@ impl<'a> SvgRenderer<'a> {
                             bbox.y1.to_bits(),
                         ));
 
-                        let shading_id = {
-                            self.shadings.insert_with(shading_key, || CachedShading {
-                                pattern: s.clone(),
-                                bbox,
-                            })
+                        let encoded = s.encode();
+                        let shading_paint = if let EncodedShadingType::RadialAxial(gradient) =
+                            &encoded.shading_type
+                            && let Some(native) =
+                                gradient.as_svg_gradient(&encoded, bbox, NATIVE_GRADIENT_TOLERANCE)
+                        {
+                            let gradient_key = gradient_key(shading_key, &native);
+                            let gradient_id =
+                                self.gradients
+                                    .insert_with(gradient_key, || CachedNativeGradient {
+                                        gradient: native,
+                                    });
+
+                            CachedShadingPaint::NativeGradient {
+                                gradient: gradient_id,
+                            }
+                        } else {
+                            let shading_id =
+                                self.shadings.insert_with(shading_key, || CachedShading {
+                                    pattern: s.clone(),
+                                    bbox,
+                                });
+
+                            CachedShadingPaint::Raster {
+                                shading: shading_id,
+                            }
                         };
 
                         let clip_path = s.shading.clip_path.clone().map(|path| {
-                            self.clip_paths.insert(CachedClipPath {
+                            self.clip_paths.insert(CachedClipPath::Path {
                                 path,
                                 fill_rule: FillRule::NonZero,
+                                parent: None,
                             })
                         });
 
@@ -91,7 +170,7 @@ impl<'a> SvgRenderer<'a> {
                                 transform: inverse_transform,
                                 bbox,
                                 clip_path,
-                                shading: shading_id,
+                                paint: shading_paint,
                             })
                     }
                     Pattern::Tiling(t) => {
@@ -101,7 +180,11 @@ impl<'a> SvgRenderer<'a> {
 
                         if !self.tiling_patterns.contains(cache_key) {
                             self.with_dummy(|r| {
-                                t.interpret(r, Affine::IDENTITY, false);
+                                t.interpret(
+                                    r,
+                                    Affine::translate((-pattern.bbox.x0, -pattern.bbox.y0)),
+                                    false,
+                                );
                             });
                         }
 
@@ -114,20 +197,6 @@ impl<'a> SvgRenderer<'a> {
                 };
 
                 (format!("url(#{id})"), 1.0)
-            }
-        };
-
-        if is_stroke {
-            self.xml.write_attribute("fill", "none");
-            self.xml.write_attribute("stroke", &paint_str);
-            if alpha != 1.0 {
-                self.xml.write_attribute("stroke-opacity", &alpha);
-            }
-        } else {
-            self.xml.write_attribute("fill", &paint_str);
-
-            if alpha != 1.0 {
-                self.xml.write_attribute("fill-opacity", &alpha);
             }
         }
     }
@@ -151,16 +220,51 @@ impl<'a> SvgRenderer<'a> {
                 &format!("matrix({})", convert_transform(&shading.transform)),
             );
 
-            self.xml.start_element("use");
-            if let Some(clip) = shading.clip_path {
-                self.xml
-                    .write_attribute_fmt("clip-path", format_args!("url(#{clip})"));
+            match &shading.paint {
+                CachedShadingPaint::Raster {
+                    shading: shading_id,
+                } => {
+                    self.xml.start_element("use");
+                    if let Some(clip) = shading.clip_path {
+                        self.xml
+                            .write_attribute_fmt("clip-path", format_args!("url(#{clip})"));
+                    }
+                    self.xml
+                        .write_attribute("xlink:href", &format!("#{shading_id}"));
+                    self.xml.end_element();
+                }
+                CachedShadingPaint::NativeGradient { gradient } => {
+                    self.xml.start_element("rect");
+                    self.xml.write_attribute("x", &shading.bbox.x0);
+                    self.xml.write_attribute("y", &shading.bbox.y0);
+                    self.xml.write_attribute("width", &shading.bbox.width());
+                    self.xml.write_attribute("height", &shading.bbox.height());
+                    if let Some(clip) = shading.clip_path {
+                        self.xml
+                            .write_attribute_fmt("clip-path", format_args!("url(#{clip})"));
+                    }
+                    self.xml
+                        .write_attribute("fill", &format!("url(#{gradient})"));
+                    self.xml.end_element();
+                }
             }
-            self.xml
-                .write_attribute("xlink:href", &format!("#{}", shading.shading));
-            self.xml.end_element();
 
             self.xml.end_element();
+        }
+
+        self.xml.end_element();
+    }
+
+    pub(crate) fn write_native_gradient_defs(&mut self) {
+        if self.gradients.is_empty() {
+            return;
+        }
+
+        self.xml.start_element("defs");
+        self.xml.write_attribute("id", "gradient");
+
+        for (id, gradient) in self.gradients.iter() {
+            write_gradient(&mut self.xml, &id.to_string(), &gradient.gradient);
         }
 
         self.xml.end_element();
@@ -182,20 +286,19 @@ impl<'a> SvgRenderer<'a> {
 
         for (id, pattern) in patterns {
             let pattern = pattern.clone();
-            let transform = pattern.transform * pattern.tiling_pattern.matrix;
+            let bbox_origin = Affine::translate((
+                pattern.tiling_pattern.bbox.x0,
+                pattern.tiling_pattern.bbox.y0,
+            ));
+            let transform = pattern.transform * pattern.tiling_pattern.matrix * bbox_origin;
 
             self.xml.start_element("pattern");
             self.xml.write_attribute("id", &id);
             self.xml.write_attribute("patternUnits", "userSpaceOnUse");
-            // TODO: Respect the xStep/yStep attribute.
-            self.xml.write_attribute(
-                "width",
-                &(pattern.tiling_pattern.bbox.x1 - pattern.tiling_pattern.bbox.x0),
-            );
-            self.xml.write_attribute(
-                "height",
-                &(pattern.tiling_pattern.bbox.y1 - pattern.tiling_pattern.bbox.y0),
-            );
+            self.xml
+                .write_attribute("width", &pattern.tiling_pattern.x_step.abs());
+            self.xml
+                .write_attribute("height", &pattern.tiling_pattern.y_step.abs());
             self.xml.write_attribute(
                 "patternTransform",
                 &format!("matrix({})", convert_transform(&transform)),
@@ -228,74 +331,123 @@ impl<'a> SvgRenderer<'a> {
 
         for (id, shading) in shadings.iter() {
             let encoded = shading.pattern.encode();
-            let (image, transform) = render_shading_texture(shading.bbox, &encoded);
-            self.write_image(&image, true, Some(id), transform);
+            let texture = encoded.render_texture(shading.bbox, 1.0);
+            let image = DynamicImage::ImageRgba8(
+                ImageBuffer::from_raw(texture.width, texture.height, texture.data).unwrap(),
+            );
+            self.write_image(&image, true, Some(id), texture.transform);
         }
 
         self.xml.end_element();
     }
 }
 
-fn render_shading_texture(
-    bbox: Rect,
-    shading_pattern: &EncodedShadingPattern,
-) -> (DynamicImage, Affine) {
-    const SCALE: f32 = 1.0;
-    const INV_SCALE: f32 = 1.0 / SCALE;
+fn rgba_to_hex(color: [f32; 4]) -> String {
+    let r = (color[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let g = (color[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let b = (color[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
 
-    let base_width = (bbox.width() as f32).max(1.0);
-    let base_height = (bbox.height() as f32).max(1.0);
-
-    let width = (base_width * SCALE).ceil() as u32;
-    let height = (base_height * SCALE).ceil() as u32;
-
-    let (x_advance, y_advance) =
-        x_y_advances(&(Affine::scale(INV_SCALE as f64) * shading_pattern.base_transform));
-
-    let mut buf = vec![0_u8; width as usize * height as usize * 4];
-    let mut start_point = shading_pattern.base_transform
-        * Affine::translate((0.5, 0.5))
-        * Point::new(bbox.x0, bbox.y0);
-
-    for row in buf.chunks_exact_mut(width as usize * 4) {
-        let mut point = start_point;
-
-        for pixel in row.chunks_exact_mut(4) {
-            let sample = shading_pattern.sample(point);
-            let converted = [
-                (sample[0] * 255.0 + 0.5) as u8,
-                (sample[1] * 255.0 + 0.5) as u8,
-                (sample[2] * 255.0 + 0.5) as u8,
-                (sample[3] * 255.0 + 0.5) as u8,
-            ];
-
-            pixel.copy_from_slice(&converted);
-
-            point += x_advance;
-        }
-
-        start_point += y_advance;
-    }
-
-    let image = DynamicImage::ImageRgba8(ImageBuffer::from_raw(width, height, buf).unwrap());
-
-    (
-        image,
-        Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(INV_SCALE as f64),
-    )
+    format!("#{r:02x}{g:02x}{b:02x}")
 }
 
-fn x_y_advances(transform: &Affine) -> (Vec2, Vec2) {
-    let scale_skew_transform = {
-        let c = transform.as_coeffs();
-        Affine::new([c[0], c[1], c[2], c[3], 0.0, 0.0])
+fn gradient_key(shading_key: u128, gradient: &SvgGradient) -> u128 {
+    let kind = match &gradient.kind {
+        SvgGradientKind::Linear { start, end } => (
+            0_u8,
+            start.x.to_bits(),
+            start.y.to_bits(),
+            0_u32,
+            end.x.to_bits(),
+            end.y.to_bits(),
+            0_u32,
+            0_u32,
+        ),
+        SvgGradientKind::Radial {
+            start_center,
+            start_radius,
+            end_center,
+            end_radius,
+        } => (
+            1_u8,
+            start_center.x.to_bits(),
+            start_center.y.to_bits(),
+            start_radius.to_bits(),
+            end_center.x.to_bits(),
+            end_center.y.to_bits(),
+            end_radius.to_bits(),
+            0_u32,
+        ),
     };
 
-    let x_advance = scale_skew_transform * Point::new(1.0, 0.0);
-    let y_advance = scale_skew_transform * Point::new(0.0, 1.0);
+    let transform = gradient.transform.as_coeffs().map(|coeff| coeff.to_bits());
+    let stops = gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            (
+                stop.offset.to_bits(),
+                stop.color.map(|component| component.to_bits()),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    (
-        Vec2::new(x_advance.x, x_advance.y),
-        Vec2::new(y_advance.x, y_advance.y),
-    )
+    hash128(&(shading_key, kind, transform, stops))
+}
+
+fn write_gradient(xml: &mut xmlwriter::XmlWriter, id: &str, gradient: &SvgGradient) {
+    match &gradient.kind {
+        SvgGradientKind::Linear { start, end } => {
+            xml.start_element("linearGradient");
+            xml.write_attribute("id", id);
+            xml.write_attribute("gradientUnits", "userSpaceOnUse");
+            xml.write_attribute(
+                "gradientTransform",
+                &format!(
+                    "matrix({})",
+                    convert_transform(&(Affine::translate((-0.5, -0.5)) * gradient.transform))
+                ),
+            );
+            xml.write_attribute("x1", &start.x);
+            xml.write_attribute("y1", &start.y);
+            xml.write_attribute("x2", &end.x);
+            xml.write_attribute("y2", &end.y);
+        }
+        SvgGradientKind::Radial {
+            start_center,
+            start_radius,
+            end_center,
+            end_radius,
+        } => {
+            xml.start_element("radialGradient");
+            xml.write_attribute("id", id);
+            xml.write_attribute("gradientUnits", "userSpaceOnUse");
+            xml.write_attribute(
+                "gradientTransform",
+                &format!(
+                    "matrix({})",
+                    convert_transform(&(Affine::translate((-0.5, -0.5)) * gradient.transform))
+                ),
+            );
+            xml.write_attribute("fx", &start_center.x);
+            xml.write_attribute("fy", &start_center.y);
+            xml.write_attribute("fr", &start_radius);
+            xml.write_attribute("cx", &end_center.x);
+            xml.write_attribute("cy", &end_center.y);
+            xml.write_attribute("r", &end_radius);
+        }
+    }
+
+    xml.write_attribute("spreadMethod", "pad");
+
+    for stop in &gradient.stops {
+        xml.start_element("stop");
+        xml.write_attribute("offset", &stop.offset);
+        xml.write_attribute("stop-color", &rgba_to_hex(stop.color));
+        if stop.color[3] < 1.0 {
+            xml.write_attribute("stop-opacity", &stop.color[3]);
+        }
+        xml.end_element();
+    }
+
+    xml.end_element();
 }

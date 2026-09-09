@@ -3,10 +3,10 @@
 //!
 //! Note that you must have downloaded the corresponding PDF file for the example to work.
 
-use hayro_interpret::font::Glyph;
+use hayro_interpret::font::GlyphRun;
 use hayro_interpret::{
-    BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterSettings, Paint,
-    PathDrawMode, SoftMask, interpret_page,
+    BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageData, ImageDrawProps,
+    InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
 };
 use hayro_syntax::Pdf;
 use image::{DynamicImage, ImageBuffer};
@@ -23,10 +23,12 @@ fn main() {
 
     let mut extractor = ImageExtractor::new();
     let settings = InterpreterSettings::default();
+    let cache = InterpreterCache::new();
     // Pass dummy values for bbox and initial transform, since we don't care about those.
     let mut context = Context::new(
         Affine::IDENTITY,
         Rect::new(0.0, 0.0, 1.0, 1.0),
+        &cache,
         pdf.xref(),
         settings,
     );
@@ -52,29 +54,19 @@ impl ImageExtractor {
 /// Implement `Device` for `ImageExtractor`. We can ignore most operations and only
 /// need to implement `draw_rgba_image` and `draw_stencil_image`.
 impl Device<'_> for ImageExtractor {
-    fn set_soft_mask(&mut self, _: Option<SoftMask<'_>>) {}
-
-    fn draw_path(&mut self, _: &BezPath, _: Affine, _: &Paint<'_>, _: &PathDrawMode) {}
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'_>, _: &DrawMode) {}
 
     fn push_clip_path(&mut self, _: &ClipPath) {}
 
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'_>>, _: BlendMode) {}
 
-    fn draw_glyph(
-        &mut self,
-        _: &Glyph<'_>,
-        _: Affine,
-        _: Affine,
-        _: &Paint<'_>,
-        _: &GlyphDrawMode,
-    ) {
-    }
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, '_>, _: DrawProps<'_>, _: &DrawMode) {}
 
-    fn pop_clip_path(&mut self) {}
+    fn pop_clip(&mut self) {}
 
     fn pop_transparency_group(&mut self) {}
 
-    fn draw_image(&mut self, image: Image<'_, '_>, _: Affine) {
+    fn draw_image(&mut self, image: Image<'_, '_>, _: ImageDrawProps<'_>) {
         match image {
             Image::Stencil(s) => {
                 s.with_stencil(
@@ -97,39 +89,39 @@ impl Device<'_> for ImageExtractor {
                 // The alpha and RGB channels are provided separately.
                 r.with_rgba(
                     |image, alpha| {
+                        let (rgb_data, width, height) = match image {
+                            ImageData::Rgb(rgb) => (rgb.data, rgb.width, rgb.height),
+                            ImageData::Luma(luma) => {
+                                let rgb = luma
+                                    .data
+                                    .iter()
+                                    .flat_map(|g| [*g, *g, *g])
+                                    .collect::<Vec<_>>();
+                                (rgb, luma.width, luma.height)
+                            }
+                        };
+
                         let image = if let Some(alpha) = alpha {
                             // This is not complete, as it can in theory happen that the alpha channel has a different
                             // dimension than the RGB channel. We ignore this edge case for this example.
-                            if alpha.width == image.width && alpha.height == image.height {
-                                let interleaved = image
-                                    .data
+                            if alpha.width == width && alpha.height == height {
+                                let interleaved = rgb_data
                                     .chunks(3)
                                     .zip(alpha.data)
                                     .flat_map(|(rgb, a)| [rgb[0], rgb[1], rgb[2], a])
                                     .collect::<Vec<u8>>();
 
                                 DynamicImage::ImageRgba8(
-                                    ImageBuffer::from_raw(image.width, image.height, interleaved)
-                                        .unwrap(),
+                                    ImageBuffer::from_raw(width, height, interleaved).unwrap(),
                                 )
                             } else {
                                 DynamicImage::ImageRgb8(
-                                    ImageBuffer::from_raw(
-                                        image.width,
-                                        image.height,
-                                        image.data.clone(),
-                                    )
-                                    .unwrap(),
+                                    ImageBuffer::from_raw(width, height, rgb_data).unwrap(),
                                 )
                             }
                         } else {
                             DynamicImage::ImageRgb8(
-                                ImageBuffer::from_raw(
-                                    image.width,
-                                    image.height,
-                                    image.data.clone(),
-                                )
-                                .unwrap(),
+                                ImageBuffer::from_raw(width, height, rgb_data).unwrap(),
                             )
                         };
 
@@ -140,6 +132,4 @@ impl Device<'_> for ImageExtractor {
             }
         }
     }
-
-    fn set_blend_mode(&mut self, _: BlendMode) {}
 }

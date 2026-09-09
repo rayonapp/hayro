@@ -2,14 +2,14 @@
 
 use crate::cache::Cache;
 use crate::color::{Color, ColorSpace};
-use crate::context::Context;
+use crate::context::{Context, InterpreterCache};
 use crate::device::Device;
-use crate::font::Glyph;
+use crate::font::GlyphRun;
 use crate::interpret::state::{ActiveTransferFunction, State};
 use crate::shading::Shading;
-use crate::soft_mask::SoftMask;
 use crate::util::{Float32Ext, RectExt, hash128};
-use crate::{BlendMode, CacheKey, ClipPath, GlyphDrawMode, Image, PathDrawMode};
+use crate::x_object::soft_mask::SoftMask;
+use crate::{BlendMode, CacheKey, ClipPath, DrawMode, DrawProps, Image, ImageDrawProps};
 use crate::{FillRule, InterpreterSettings, Paint, interpret};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::object::Dict;
@@ -17,11 +17,10 @@ use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{
     BBOX, EXT_G_STATE, MATRIX, PAINT_TYPE, RESOURCES, SHADING, X_STEP, Y_STEP,
 };
-use hayro_syntax::object::{Object, dict_or_stream};
+use hayro_syntax::object::{Object, ObjectIdentifier, dict_or_stream};
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, Rect, Shape};
-use log::warn;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -40,18 +39,16 @@ impl<'a> Pattern<'a> {
         ctx: &Context<'a>,
         resources: &Resources<'a>,
     ) -> Option<Self> {
-        if let Some(dict) = object.clone().into_dict() {
-            Some(Self::Shading(ShadingPattern::new(
+        match object {
+            Object::Dict(dict) => Some(Self::Shading(ShadingPattern::new(
                 &dict,
-                &ctx.object_cache,
+                &ctx.interpreter_cache.object_cache,
                 ctx.get().graphics_state.non_stroke_alpha,
-            )?))
-        } else if let Some(stream) = object.clone().into_stream() {
-            Some(Self::Tiling(Box::new(TilingPattern::new(
+            )?)),
+            Object::Stream(stream) => Some(Self::Tiling(Box::new(TilingPattern::new(
                 stream, ctx, resources,
-            )?)))
-        } else {
-            None
+            )?))),
+            _ => None,
         }
     }
 
@@ -100,7 +97,7 @@ impl ShadingPattern {
         let shading = dict.get::<Object<'_>>(SHADING).and_then(|o| {
             let (dict, stream) = dict_or_stream(&o)?;
 
-            Shading::new(&dict, stream.as_ref(), cache)
+            Shading::new(dict, stream, cache)
         })?;
         let matrix = dict
             .get::<[f64; 6]>(MATRIX)
@@ -144,9 +141,10 @@ pub struct TilingPattern<'a> {
     pub(crate) stroke_paint: Color,
     pub(crate) non_stroking_paint: Color,
     pub(crate) parent_resources: Resources<'a>,
-    pub(crate) cache: Cache,
+    pub(crate) cache: InterpreterCache<'a>,
     pub(crate) settings: InterpreterSettings,
     pub(crate) xref: &'a XRef,
+    nesting_depth: u32,
 }
 
 impl Debug for TilingPattern<'_> {
@@ -202,6 +200,7 @@ impl<'a> TilingPattern<'a> {
             state.graphics_state.stroke_color.clone(),
             state.graphics_state.stroke_alpha,
         );
+        let nesting_depth = ctx.nesting_depth() + 1;
 
         Some(Self {
             cache_key,
@@ -216,8 +215,9 @@ impl<'a> TilingPattern<'a> {
             non_stroking_paint,
             settings: ctx.settings.clone(),
             parent_resources: resources.clone(),
-            cache: ctx.object_cache.clone(),
+            cache: ctx.interpreter_cache.clone(),
             xref: ctx.xref,
+            nesting_depth,
         })
     }
 
@@ -234,10 +234,11 @@ impl<'a> TilingPattern<'a> {
             state.ctm,
             // TODO: bbox?
             (initial_transform * self.ctx_bbox.to_path(0.1)).bounding_box(),
-            self.cache.clone(),
+            &self.cache,
             self.xref,
             self.settings.clone(),
             state,
+            self.nesting_depth,
         );
 
         let decoded = self.stream.decoded().ok()?;
@@ -266,7 +267,7 @@ impl<'a> TilingPattern<'a> {
             interpret(iter, &resources, &mut context, &mut device);
         }
 
-        device.pop_clip_path();
+        device.pop_clip();
 
         Some(())
     }
@@ -294,18 +295,26 @@ impl<'a, 'b, T: Device<'a>> StencilPatternDevice<'a, 'b, T> {
 
 // Only filling, stroking of paths and stencil masks are allowed.
 impl<'a, T: Device<'a>> Device<'a> for StencilPatternDevice<'a, '_, T> {
-    fn draw_path(
+    fn begin_optional_content(
         &mut self,
-        path: &BezPath,
-        transform: Affine,
-        _: &Paint<'_>,
-        draw_mode: &PathDrawMode,
-    ) {
-        self.inner
-            .draw_path(path, transform, &self.paint, draw_mode);
+        id: Option<ObjectIdentifier>,
+        properties: &Dict<'_>,
+        visible: bool,
+    ) -> bool {
+        self.inner.begin_optional_content(id, properties, visible)
     }
 
-    fn set_soft_mask(&mut self, _: Option<SoftMask<'_>>) {}
+    fn end_optional_content(&mut self) {
+        self.inner.end_optional_content();
+    }
+
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        let props = DrawProps {
+            paint: self.paint.clone(),
+            ..props
+        };
+        self.inner.draw_path(path, props, draw_mode);
+    }
 
     fn push_clip_path(&mut self, clip_path: &ClipPath) {
         self.inner.push_clip_path(clip_path);
@@ -313,30 +322,25 @@ impl<'a, T: Device<'a>> Device<'a> for StencilPatternDevice<'a, '_, T> {
 
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'_>>, _: BlendMode) {}
 
-    fn draw_glyph(
+    fn draw_glyph_run(
         &mut self,
-        g: &Glyph<'a>,
-        transform: Affine,
-        glyph_transform: Affine,
-        p: &Paint<'a>,
-        draw_mode: &GlyphDrawMode,
+        glyph_run: &GlyphRun<'_, 'a>,
+        props: DrawProps<'a>,
+        draw_mode: &DrawMode,
     ) {
-        self.inner
-            .draw_glyph(g, transform, glyph_transform, p, draw_mode);
+        self.inner.draw_glyph_run(glyph_run, props, draw_mode);
     }
 
-    fn draw_image(&mut self, image: Image<'a, '_>, transform: Affine) {
+    fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
         if let Image::Stencil(mut s) = image {
             s.paint = self.paint.clone();
-            self.inner.draw_image(Image::Stencil(s), transform);
+            self.inner.draw_image(Image::Stencil(s), props);
         }
     }
 
-    fn pop_clip_path(&mut self) {
-        self.inner.pop_clip_path();
+    fn pop_clip(&mut self) {
+        self.inner.pop_clip();
     }
 
     fn pop_transparency_group(&mut self) {}
-
-    fn set_blend_mode(&mut self, _: BlendMode) {}
 }

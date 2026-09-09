@@ -1,7 +1,7 @@
 //! Interacting with the different kinds of PDF fonts.
 
-use crate::cache::Cache;
 use crate::context::Context;
+use crate::context::InterpreterCache;
 use crate::device::Device;
 use crate::font::cid::Type0Font;
 use crate::font::generated::{
@@ -20,9 +20,9 @@ use hayro_syntax::object::{Dict, Stream};
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, Vec2};
-use log::warn;
 use outline::OutlineFont;
 use skrifa::GlyphId;
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -104,6 +104,39 @@ impl Glyph<'_> {
             Glyph::Outline(g) => g.as_unicode(),
             Glyph::Type3(g) => g.as_unicode(),
         }
+    }
+}
+
+/// A glyph and its position within a [`GlyphRun`].
+pub struct PositionedGlyph<'a> {
+    pub(crate) glyph: Glyph<'a>,
+    pub(crate) transform: Affine,
+}
+
+impl PositionedGlyph<'_> {
+    /// Return the transform that places this glyph in text space.
+    pub fn transform(&self) -> Affine {
+        self.transform
+    }
+}
+
+impl<'a> Deref for PositionedGlyph<'a> {
+    type Target = Glyph<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.glyph
+    }
+}
+
+/// A fully materialized run of positioned glyphs.
+pub struct GlyphRun<'run, 'a> {
+    pub(crate) glyphs: &'run [PositionedGlyph<'a>],
+}
+
+impl<'run, 'a> GlyphRun<'run, 'a> {
+    /// Return the glyphs in the run.
+    pub fn glyphs(&self) -> &'run [PositionedGlyph<'a>] {
+        self.glyphs
     }
 }
 
@@ -189,9 +222,10 @@ pub struct Type3Glyph<'a> {
     pub(crate) glyph_id: GlyphId,
     pub(crate) state: State<'a>,
     pub(crate) parent_resources: Resources<'a>,
-    pub(crate) cache: Cache,
+    pub(crate) cache: InterpreterCache<'a>,
     pub(crate) xref: &'a XRef,
     pub(crate) settings: InterpreterSettings,
+    pub(crate) nesting_depth: u32,
     pub(crate) char_code: u32,
 }
 
@@ -232,7 +266,7 @@ impl<'a> Font<'a> {
         font_resolver: &FontResolverFn,
         cmap_resolver: &CMapResolverFn,
     ) -> Option<Self> {
-        let f_type = match dict.get::<Name>(SUBTYPE)?.deref() {
+        let f_type = match dict.get::<Name<'_>>(SUBTYPE)?.deref() {
             TYPE1 | MM_TYPE1 => {
                 FontType::Type1(Rc::new(Type1Font::new(dict, font_resolver, cmap_resolver)?))
             }
@@ -295,13 +329,8 @@ impl<'a> Font<'a> {
         char_code: u32,
         ctx: &mut Context<'a>,
         resources: &Resources<'a>,
-        origin_displacement: Vec2,
-    ) -> (Glyph<'a>, Affine) {
-        let glyph_transform = ctx.get().text_state.full_transform()
-            * Affine::scale(1.0 / UNITS_PER_EM as f64)
-            * Affine::translate(origin_displacement);
-
-        let glyph = match &self.1 {
+    ) -> Glyph<'a> {
+        match &self.1 {
             FontType::Type1(t) => {
                 let font = OutlineFont::Type1(t.clone());
                 Glyph::Outline(OutlineGlyph {
@@ -327,22 +356,22 @@ impl<'a> Font<'a> {
                 })
             }
             FontType::Type3(t) => {
+                let nesting_depth = ctx.nesting_depth() + 1;
                 let shape_glyph = Type3Glyph {
                     font: t.clone(),
                     glyph_id: glyph,
                     state: ctx.get().clone(),
                     parent_resources: resources.clone(),
-                    cache: ctx.object_cache.clone(),
+                    cache: ctx.interpreter_cache.clone(),
                     xref: ctx.xref,
                     settings: ctx.settings.clone(),
+                    nesting_depth,
                     char_code,
                 };
 
                 Glyph::Type3(Box::new(shape_glyph))
             }
-        };
-
-        (glyph, glyph_transform)
+        }
     }
 
     pub(crate) fn code_advance(&self, code: u32) -> Vec2 {
@@ -528,7 +557,7 @@ pub struct FallbackFontQuery {
 impl FallbackFontQuery {
     pub(crate) fn new(dict: &Dict<'_>) -> Self {
         let post_script_name = dict
-            .get::<Name>(BASE_FONT)
+            .get::<Name<'_>>(BASE_FONT)
             .map(|n| strip_subset_prefix(n.as_str()).to_string());
 
         let mut data = Self {
@@ -538,13 +567,13 @@ impl FallbackFontQuery {
 
         if let Some(descriptor) = dict.get::<Dict<'_>>(FONT_DESC) {
             data.font_name = dict
-                .get::<Name>(FONT_NAME)
+                .get::<Name<'_>>(FONT_NAME)
                 .map(|n| strip_subset_prefix(n.as_str()).to_string());
             data.font_family = descriptor
-                .get::<Name>(FONT_FAMILY)
+                .get::<Name<'_>>(FONT_FAMILY)
                 .map(|n| n.as_str().to_string());
             data.font_stretch = descriptor
-                .get::<Name>(FONT_STRETCH)
+                .get::<Name<'_>>(FONT_STRETCH)
                 .map(|n| FontStretch::from_string(n.as_str()))
                 .unwrap_or(FontStretch::Normal);
             data.font_weight = descriptor.get::<u32>(FONT_WEIGHT).unwrap_or(400);
@@ -650,9 +679,9 @@ pub(crate) fn read_to_unicode(dict: &Dict<'_>, cmap_resolver: &CMapResolverFn) -
         // See PDFJS-11915, where `Identity-H` is used for `ToUnicode`. I don't
         // believe it's valid, but at least mupdf seems to be able to deal with it.
         .or_else(|| {
-            dict.get::<Name>(TO_UNICODE)
+            dict.get::<Name<'_>>(TO_UNICODE)
                 .and_then(|name| (cmap_resolver)(CMapName::from_bytes(name.as_ref())))
-                .map(|d| d.to_vec())
+                .map(|d| Cow::Owned(d.to_vec()))
         })
         .and_then(|data| {
             let cmap_resolver = cmap_resolver.clone();

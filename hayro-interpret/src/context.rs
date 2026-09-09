@@ -1,34 +1,66 @@
 use crate::cache::{Cache, CacheKey};
-use crate::color::ColorSpace;
+use crate::color::{Color, ColorSpace};
 use crate::convert::convert_transform;
-use crate::font::{Font, StandardFont};
+use crate::font::{Font, PositionedGlyph, StandardFont};
 use crate::interpret::state::{ClipType, State, TextStateFont};
 use crate::ocg::OcgState;
 use crate::util::{BezPathExt, Float64Ext};
-use crate::{ClipPath, Device, FillRule, InterpreterSettings, StrokeProps};
+use crate::{ClipPath, Device, DrawProps, FillRule, InterpreterSettings, Paint, StrokeProps};
 use hayro_syntax::content::ops::Transform;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
-use log::warn;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use smallvec::smallvec;
+use std::cell::RefCell;
+use std::rc::Rc;
 
-/// A context for interpreting PDF files.
+/// Maximum nesting depth for interpreting `XObject`'s/patterns/streams.
+pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
+
+/// A cache used by the interpreter.
+///
+/// Ideally, such a cache should be constructed once per PDF and then reused across
+/// multiple interpreter invocations on the same document.
+#[derive(Clone)]
+pub struct InterpreterCache<'a> {
+    pub(crate) font_cache: Rc<RefCell<FxHashMap<u128, Option<Font<'a>>>>>,
+    pub(crate) object_cache: Cache,
+}
+
+impl<'a> Default for InterpreterCache<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> InterpreterCache<'a> {
+    /// Create a new interpreter cache.
+    pub fn new() -> Self {
+        Self {
+            font_cache: Rc::new(RefCell::new(FxHashMap::default())),
+            object_cache: Cache::new(),
+        }
+    }
+}
+
+/// A per-page interpretation context that borrows shared data from an [`InterpreterCache`].
 pub struct Context<'a> {
     states: Vec<State<'a>>,
     path: BezPath,
     sub_path_start: Point,
     last_point: Point,
     clip: Option<FillRule>,
-    pub(crate) font_cache: HashMap<u128, Option<Font<'a>>>,
     root_transforms: Vec<Affine>,
     bbox: Vec<Rect>,
     pub(crate) settings: InterpreterSettings,
-    pub(crate) object_cache: Cache,
+    pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) xref: &'a XRef,
     pub(crate) ocg_state: OcgState,
+    nesting_depth: u32,
+    pub(crate) glyph_scratch: Vec<PositionedGlyph<'a>>,
 }
 
 impl<'a> Context<'a> {
@@ -36,22 +68,23 @@ impl<'a> Context<'a> {
     pub fn new(
         initial_transform: Affine,
         bbox: Rect,
+        cache: &InterpreterCache<'a>,
         xref: &'a XRef,
         settings: InterpreterSettings,
     ) -> Self {
-        let cache = Cache::new();
         let state = State::new(initial_transform);
 
-        Self::new_with(initial_transform, bbox, cache, xref, settings, state)
+        Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0)
     }
 
     pub(crate) fn new_with(
         initial_transform: Affine,
         bbox: Rect,
-        cache: Cache,
+        cache: &InterpreterCache<'a>,
         xref: &'a XRef,
         settings: InterpreterSettings,
         state: State<'a>,
+        nesting_depth: u32,
     ) -> Self {
         let ocg_state = {
             let root_ref = xref.root_id();
@@ -70,9 +103,10 @@ impl<'a> Context<'a> {
             clip: None,
             bbox: vec![bbox],
             path: BezPath::new(),
-            font_cache: HashMap::new(),
-            object_cache: cache,
+            interpreter_cache: cache.clone(),
             ocg_state,
+            nesting_depth,
+            glyph_scratch: Vec::new(),
         }
     }
 
@@ -120,6 +154,11 @@ impl<'a> Context<'a> {
                 self.get_mut().clips.push(ClipType::Dummy);
                 return;
             }
+
+            device.push_clip_rect(&clip_rect);
+            self.push_bbox(clip_rect);
+            self.get_mut().clips.push(ClipType::Real);
+            return;
         }
 
         let bbox = clip_path.bounding_box();
@@ -131,9 +170,9 @@ impl<'a> Context<'a> {
         self.get_mut().clips.push(ClipType::Real);
     }
 
-    pub(crate) fn pop_clip_path(&mut self, device: &mut impl Device<'a>) {
+    pub(crate) fn pop_clip(&mut self, device: &mut impl Device<'a>) {
         if let Some(ClipType::Real) = self.get_mut().clips.pop() {
-            device.pop_clip_path();
+            device.pop_clip();
             self.pop_bbox();
         }
     }
@@ -168,19 +207,53 @@ impl<'a> Context<'a> {
         };
 
         while self.get().clips.len() > target_clips {
-            self.pop_clip_path(device);
+            self.pop_clip(device);
         }
 
         // The first state should never be popped.
         if self.states.len() > 1 {
             self.states.pop();
         }
+    }
 
-        device.set_soft_mask(
-            self.states
-                .last()
-                .and_then(|l| l.graphics_state.soft_mask.clone()),
-        );
+    pub(crate) fn draw_props(&self, is_stroke: bool) -> DrawProps<'a> {
+        DrawProps {
+            transform: self.get().ctm,
+            paint: self.get_paint(is_stroke),
+            soft_mask: self.get().graphics_state.soft_mask.clone(),
+            blend_mode: self.get().graphics_state.blend_mode,
+        }
+    }
+
+    pub(crate) fn get_paint(&self, is_stroke: bool) -> Paint<'a> {
+        let data = if is_stroke {
+            self.get().stroke_data()
+        } else {
+            self.get().non_stroke_data()
+        };
+
+        if data.color_space.is_pattern() || data.pattern.is_some() {
+            if let Some(mut pattern) = data.pattern {
+                if let Some(tf) = &data.transfer_function {
+                    pattern.set_transfer_function(tf.clone());
+                }
+
+                pattern.pre_concat_transform(self.root_transform());
+
+                Paint::Pattern(Box::new(pattern))
+            } else {
+                // Pattern was likely invalid, use transparent paint.
+                Paint::Color(Color::new(ColorSpace::device_gray(), smallvec![0.0], 0.0))
+            }
+        } else {
+            let color = Color::new(data.color_space, data.color, data.alpha);
+
+            if let Some(tf) = &data.transfer_function {
+                Paint::Color(Color::from_rgba(tf.apply(&color.to_rgba())))
+            } else {
+                Paint::Color(color)
+            }
+        }
     }
 
     pub(crate) fn path(&self) -> &BezPath {
@@ -234,12 +307,13 @@ impl<'a> Context<'a> {
     pub(crate) fn get_color_space(
         &mut self,
         resources: &Resources<'_>,
-        name: Name,
+        name: &Name<'_>,
     ) -> Option<ColorSpace> {
         let cs_object = resources.get_color_space(name)?;
-        self.object_cache
+        self.interpreter_cache
+            .object_cache
             .get_or_insert_with(cs_object.cache_key(), || {
-                ColorSpace::new(cs_object.clone(), &self.object_cache)
+                ColorSpace::new(cs_object.clone(), &self.interpreter_cache.object_cache)
             })
     }
 
@@ -251,21 +325,43 @@ impl<'a> Context<'a> {
         self.states.len()
     }
 
+    pub(crate) fn nesting_depth(&self) -> u32 {
+        self.nesting_depth
+    }
+
+    pub(crate) fn begin_nested_interpretation(&mut self) -> bool {
+        if self.nesting_depth >= MAX_NESTED_INTERPRETATION_DEPTH {
+            warn!("interpreter nesting depth exceeded");
+
+            return false;
+        }
+
+        self.nesting_depth += 1;
+
+        true
+    }
+
+    pub(crate) fn end_nested_interpretation(&mut self) {
+        self.nesting_depth = self.nesting_depth.saturating_sub(1);
+    }
     pub(crate) fn resolve_font(&mut self, font_dict: &Dict<'a>) -> Option<TextStateFont<'a>> {
         let cache_key = font_dict.cache_key();
 
-        if let Some(resolved) = self
-            .font_cache
-            .entry(cache_key)
-            .or_insert_with(|| {
-                Font::new(
-                    font_dict,
-                    &self.settings.font_resolver,
-                    &self.settings.cmap_resolver,
-                )
-            })
-            .clone()
-        {
+        let resolved = {
+            let mut font_cache = self.interpreter_cache.font_cache.borrow_mut();
+            font_cache
+                .entry(cache_key)
+                .or_insert_with(|| {
+                    Font::new(
+                        font_dict,
+                        &self.settings.font_resolver,
+                        &self.settings.cmap_resolver,
+                    )
+                })
+                .clone()
+        };
+
+        if let Some(resolved) = resolved {
             Some(TextStateFont::Font(resolved))
         } else {
             Font::new_standard(StandardFont::Helvetica, &self.settings.font_resolver)
@@ -275,41 +371,35 @@ impl<'a> Context<'a> {
 }
 
 pub(crate) fn path_as_rect(path: &BezPath) -> Option<Rect> {
-    // One MoveTo, three LineTo, one ClosePath
-    if path.elements().len() != 5 {
-        return None;
-    }
-
-    let bbox = path.fast_bounding_box();
-    let (min_x, min_y, max_x, max_y) = (bbox.min_x(), bbox.min_y(), bbox.max_x(), bbox.max_y());
-    let mut corners = [false; 4];
-
-    let mut check_point = |p: Point| {
-        corners[0] |= p.x.is_nearly_equal(min_x) && p.y.is_nearly_equal(min_y);
-        corners[1] |= p.x.is_nearly_equal(min_x) && p.y.is_nearly_equal(max_y);
-        corners[2] |= p.x.is_nearly_equal(max_x) && p.y.is_nearly_equal(min_y);
-        corners[3] |= p.x.is_nearly_equal(max_x) && p.y.is_nearly_equal(max_y);
+    let points = match path.elements() {
+        [
+            PathEl::MoveTo(first),
+            PathEl::LineTo(second),
+            PathEl::LineTo(third),
+            PathEl::LineTo(fourth),
+            PathEl::ClosePath,
+        ] => [*first, *second, *third, *fourth, *first],
+        [
+            PathEl::MoveTo(first),
+            PathEl::LineTo(second),
+            PathEl::LineTo(third),
+            PathEl::LineTo(fourth),
+            PathEl::LineTo(last),
+        ] if first.x.is_nearly_equal(last.x) && first.y.is_nearly_equal(last.y) => {
+            [*first, *second, *third, *fourth, *last]
+        }
+        _ => return None,
     };
 
-    for (idx, el) in path.elements().iter().enumerate() {
-        match el {
-            PathEl::MoveTo(p) => {
-                if idx != 0 {
-                    return None;
-                }
-
-                check_point(*p);
-            }
-            PathEl::LineTo(l) => check_point(*l),
-            PathEl::QuadTo(_, _) => return None,
-            PathEl::CurveTo(_, _, _) => return None,
-            PathEl::ClosePath => {}
+    let mut previous_axis = None;
+    for edge in points.windows(2) {
+        let same_x = edge[0].x.is_nearly_equal(edge[1].x);
+        let same_y = edge[0].y.is_nearly_equal(edge[1].y);
+        if same_x == same_y || previous_axis == Some(same_x) {
+            return None;
         }
+        previous_axis = Some(same_x);
     }
 
-    if corners[0] && corners[1] && corners[2] && corners[3] {
-        Some(bbox)
-    } else {
-        None
-    }
+    Some(path.fast_bounding_box())
 }

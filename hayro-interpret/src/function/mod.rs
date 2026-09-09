@@ -15,12 +15,12 @@ use crate::function::type4::Type4;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::dict::keys::{DOMAIN, FUNCTION_TYPE, RANGE};
 use hayro_syntax::object::{Object, dict_or_stream};
-use log::warn;
 use smallvec::SmallVec;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The input/output type of functions.
 pub(crate) type Values = SmallVec<[f32; 4]>;
+pub(crate) type StitchingBounds = SmallVec<[f32; 3]>;
 type TupleVec = SmallVec<[(f32, f32); 4]>;
 
 #[derive(Debug)]
@@ -41,10 +41,10 @@ impl Function {
         let (dict, stream) = dict_or_stream(obj)?;
 
         let function_type = match dict.get::<u8>(FUNCTION_TYPE)? {
-            0 => FunctionType::Type0(Type0::new(&stream?)?),
-            2 => FunctionType::Type2(Type2::new(&dict)?),
-            3 => FunctionType::Type3(Type3::new(&dict)?),
-            4 => FunctionType::Type4(Type4::new(&stream?)?),
+            0 => FunctionType::Type0(Type0::new(stream?)?),
+            2 => FunctionType::Type2(Type2::new(dict)?),
+            3 => FunctionType::Type3(Type3::new(dict)?),
+            4 => FunctionType::Type4(Type4::new(stream?)?),
             _ => return None,
         };
 
@@ -59,6 +59,58 @@ impl Function {
             FunctionType::Type3(t3) => t3.eval(*input.first()?),
             FunctionType::Type4(t4) => Some(t4.eval(input)?),
         }
+    }
+
+    pub(crate) fn stitching_bounds(&self) -> StitchingBounds {
+        match self.0.as_ref() {
+            FunctionType::Type3(t3) => t3.stitching_bounds(),
+            _ => SmallVec::new(),
+        }
+    }
+}
+
+/// A transfer function.
+#[derive(Clone, Debug)]
+pub struct TransferFunction {
+    function: Function,
+    samples: Arc<OnceLock<[u8; 256]>>,
+}
+
+impl TransferFunction {
+    pub(crate) fn new(function: Function) -> Self {
+        Self {
+            function,
+            samples: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Apply the transfer function to a buffer of values.
+    pub fn apply_to(&self, values: &mut [u8]) {
+        self.apply_to_stride(values, 1);
+    }
+
+    pub(crate) fn apply_to_stride(&self, values: &mut [u8], stride: usize) {
+        let samples = self.samples();
+
+        for value in values.iter_mut().step_by(stride) {
+            *value = samples[*value as usize];
+        }
+    }
+
+    pub(crate) fn apply_f32(&self, value: f32) -> f32 {
+        self.samples()[(value * 255.0 + 0.5) as u8 as usize] as f32 / 255.0
+    }
+
+    fn samples(&self) -> &[u8; 256] {
+        self.samples.get_or_init(|| {
+            std::array::from_fn(|sample| {
+                self.function
+                    .eval(smallvec::smallvec![sample as f32 / 255.0])
+                    .and_then(|output| output.first().copied())
+                    .map(|output| (output * 255.0 + 0.5) as u8)
+                    .unwrap_or(sample as u8)
+            })
+        })
     }
 }
 

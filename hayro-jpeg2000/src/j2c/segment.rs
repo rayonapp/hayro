@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use super::build::Segment;
 use super::codestream::markers::{EPH, SOP};
 use super::codestream::{ComponentInfo, Header};
-use super::decode::{DecompositionStorage, TileDecodeContext};
+use super::decode::DecompositionStorage;
 use super::progression::ProgressionData;
 use super::tile::{Tile, TilePart};
 use crate::error::{Result, TileError, bail};
@@ -13,10 +13,9 @@ use crate::reader::BitReader;
 
 pub(crate) const MAX_BITPLANE_COUNT: u8 = 32;
 
-pub(crate) fn parse<'a>(
-    tile: &'a Tile<'a>,
+pub(crate) fn parse<'a, 'b>(
+    tile: &'b Tile<'a>,
     mut progression_iterator: Box<dyn Iterator<Item = ProgressionData> + '_>,
-    tile_ctx: &mut TileDecodeContext<'a>,
     header: &Header<'_>,
     storage: &mut DecompositionStorage<'a>,
 ) -> Result<()> {
@@ -24,7 +23,7 @@ pub(crate) fn parse<'a>(
         if parse_inner(
             tile_part.clone(),
             &mut progression_iterator,
-            tile_ctx,
+            &tile.component_infos,
             storage,
         )
         .is_none()
@@ -40,13 +39,13 @@ pub(crate) fn parse<'a>(
 fn parse_inner<'a>(
     mut tile_part: TilePart<'a>,
     progression_iterator: &mut dyn Iterator<Item = ProgressionData>,
-    tile_ctx: &mut TileDecodeContext<'a>,
+    component_infos: &[ComponentInfo],
     storage: &mut DecompositionStorage<'a>,
 ) -> Option<()> {
     while !tile_part.header().at_end() {
         let progression_data = progression_iterator.next()?;
         let resolution = progression_data.resolution;
-        let component_info = &tile_ctx.tile.component_infos[progression_data.component as usize];
+        let component_info = &component_infos[progression_data.component as usize];
         let tile_decompositions =
             &mut storage.tile_decompositions[progression_data.component as usize];
         let sub_band_iter = tile_decompositions.sub_band_iter(resolution, &storage.decompositions);
@@ -131,7 +130,7 @@ fn resolve_segments(
     let precincts = &mut storage.precincts[sub_band.precincts.clone()];
     let Some(precinct) = precincts.get_mut(progression_data.precinct as usize) else {
         // An invalid file could trigger this code path.
-        lwarn!("progression data yielded invalid precinct index");
+        warn!("progression data yielded invalid precinct index");
 
         return None;
     };
@@ -167,7 +166,7 @@ fn resolve_segments(
             )? <= progression_data.layer_num as u32
         };
 
-        ltrace!("code-block inclusion: {}", is_included);
+        trace!("code-block inclusion: {}", is_included);
 
         if !is_included {
             continue;
@@ -197,7 +196,7 @@ fn resolve_segments(
                 u32::MAX,
                 &mut storage.tag_tree_nodes,
             )? as u8;
-            ltrace!(
+            trace!(
                 "zero bit-plane information: {}",
                 code_block.missing_bit_planes
             );
@@ -234,7 +233,7 @@ fn resolve_segments(
             return None;
         } as u8;
 
-        ltrace!("number of coding passes: {}", added_coding_passes);
+        trace!("number of coding passes: {}", added_coding_passes);
 
         let mut k = 0;
 
@@ -298,7 +297,7 @@ fn resolve_segments(
                 data: &[],
             });
 
-            ltrace!("length({segment}) {}", length);
+            trace!("length({segment}) {}", length);
 
             Some(())
         };

@@ -3,7 +3,9 @@ use crate::color::Color;
 use crate::pattern::Pattern;
 use crate::util::hash128;
 use crate::x_object::ImageXObject;
-use kurbo::{BezPath, Cap, Join};
+use crate::x_object::soft_mask::SoftMask;
+use hayro_syntax::object::Stream;
+use kurbo::{Affine, BezPath, Cap, Join};
 use smallvec::{SmallVec, smallvec};
 
 /// A clip path.
@@ -40,12 +42,8 @@ impl<'a, 'b> StencilImage<'a, 'b> {
         func: impl FnOnce(LumaData, &Paint<'a>),
         target_dimension: Option<(u32, u32)>,
     ) {
-        if let Some(luma) = self
-            .image_xobject
-            .decoded_object(target_dimension)
-            .and_then(|d| d.luma_data)
-        {
-            func(luma, &self.paint);
+        if let Some(decoded) = self.image_xobject.decoded_mask(target_dimension) {
+            func(decoded.luma, &self.paint);
         }
     }
 
@@ -81,16 +79,19 @@ impl RasterImage<'_> {
     /// certain cases.
     pub fn with_rgba(
         &self,
-        func: impl FnOnce(RgbData, Option<LumaData>),
+        func: impl FnOnce(ImageData, Option<LumaData>),
         target_dimension: Option<(u32, u32)>,
     ) {
-        let decoded = self.0.decoded_object(target_dimension);
-
-        if let Some(decoded) = decoded
-            && let Some(rgb) = decoded.rgb_data
-        {
-            func(rgb, decoded.luma_data);
+        if let Some(decoded) = self.0.decoded_image(target_dimension) {
+            func(decoded.image, decoded.alpha);
         }
+    }
+
+    /// Return the underlying stream object.
+    ///
+    /// This allows you to get access to the raw encoded image data, without doing any decoding.
+    pub fn stream(&self) -> &Stream<'_> {
+        self.0.stream()
     }
 
     // These are hidden since clients are supposed to call get the
@@ -203,6 +204,49 @@ pub struct LumaData {
     pub scale_factors: (f32, f32),
 }
 
+/// The color data of a raster image, either 3-channel RGB or 1-channel luma.
+#[derive(Clone)]
+pub enum ImageData {
+    /// 3-channel RGB data.
+    Rgb(RgbData),
+    /// 1-channel grayscale data.
+    Luma(LumaData),
+}
+
+impl ImageData {
+    /// The width of the image.
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Rgb(d) => d.width,
+            Self::Luma(d) => d.width,
+        }
+    }
+
+    /// The height of the image.
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Rgb(d) => d.height,
+            Self::Luma(d) => d.height,
+        }
+    }
+
+    /// Whether the image should be interpolated.
+    pub fn interpolate(&self) -> bool {
+        match self {
+            Self::Rgb(d) => d.interpolate,
+            Self::Luma(d) => d.interpolate,
+        }
+    }
+
+    /// The scaling factors of the image.
+    pub fn scale_factors(&self) -> (f32, f32) {
+        match self {
+            Self::Rgb(d) => d.scale_factors,
+            Self::Luma(d) => d.scale_factors,
+        }
+    }
+}
+
 /// A type of paint.
 #[derive(Clone, Debug)]
 pub enum Paint<'a> {
@@ -225,22 +269,39 @@ impl CacheKey for Paint<'_> {
     }
 }
 
-/// The draw mode that should be used for a path.
+/// Properties for a painted drawing operation.
+#[derive(Clone)]
+pub struct DrawProps<'a> {
+    /// The transform.
+    pub transform: Affine,
+    /// The paint.
+    pub paint: Paint<'a>,
+    /// The soft mask.
+    pub soft_mask: Option<SoftMask<'a>>,
+    /// The blend mode.
+    pub blend_mode: BlendMode,
+}
+
+/// Properties for an image drawing operation.
+#[derive(Clone)]
+pub struct ImageDrawProps<'a> {
+    /// The transform.
+    pub transform: Affine,
+    /// The soft mask.
+    pub soft_mask: Option<SoftMask<'a>>,
+    /// The blend mode.
+    pub blend_mode: BlendMode,
+}
+
+/// The draw mode.
 #[derive(Clone, Debug)]
-pub enum PathDrawMode {
+pub enum DrawMode {
     /// Draw using a fill.
     Fill(FillRule),
     /// Draw using a stroke.
     Stroke(StrokeProps),
-}
-
-/// The draw mode that should be used for a glyph.
-#[derive(Clone, Debug)]
-pub enum GlyphDrawMode {
-    /// Draw using a fill.
-    Fill,
-    /// Draw using a stroke.
-    Stroke(StrokeProps),
+    /// Draw using both fill and stroke.
+    FillAndStroke(FillRule, StrokeProps),
     /// Invisible text (for text extraction but not visual rendering).
     Invisible,
 }

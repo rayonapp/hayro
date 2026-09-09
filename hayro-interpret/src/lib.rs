@@ -28,6 +28,9 @@ This crate has one optional feature:
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[macro_use]
+mod log;
+
 mod cache;
 mod context;
 mod convert;
@@ -35,13 +38,13 @@ mod device;
 mod function;
 mod interpret;
 mod ocg;
-mod soft_mask;
 mod types;
 mod x_object;
 
 pub mod color;
 pub mod encode;
 pub mod font;
+pub mod gradient;
 pub mod pattern;
 pub mod shading;
 pub mod util;
@@ -49,10 +52,10 @@ pub mod util;
 pub use cache::CacheKey;
 pub use context::*;
 pub use device::*;
-pub use function::Function;
+pub use function::{Function, TransferFunction};
 pub use hayro_cmap;
 pub use hayro_syntax;
 pub use interpret::*;
-pub use soft_mask::*;
 pub use types::*;
-pub use util::{PageExt, RectExt};
+pub use util::{RectExt, TransformExt};
+pub use x_object::soft_mask::*;

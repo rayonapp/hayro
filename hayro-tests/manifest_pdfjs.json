@@ -123,7 +123,10 @@
   "bug1791583",
   "bug1795263",
   "bug1799927",
-  "bug1820909",
+  {
+    "id": "bug1820909",
+    "last_page": 10
+  },
   "bug1826783",
   {
     "id": "bug1898802",
@@ -260,7 +263,7 @@
   "images_1bit_grayscale",
   {
     "id": "intelisa",
-    "last_page": 99
+    "last_page": 10
   },
   "isssue18194",
   "issue1002",
@@ -316,7 +319,10 @@
     "id": "issue11306",
     "last_page": 0
   },
-  "issue1133",
+  {
+    "id": "issue1133",
+    "last_page": 10
+  },
   {
     "id": "issue11330",
     "last_page": 0
@@ -1115,7 +1121,10 @@
   "operator-in-TJ-array",
   "pattern_text_embedded_font",
   "personwithdog",
-  "protectip",
+  {
+    "id": "protectip",
+    "last_page": 10
+  },
   "shavian-load",
   "simpletype3font",
   "standard_fonts_no_system_fonts",
@@ -1339,15 +1348,8 @@
     "id": "ShowText-ShadingPattern",
     "comment": "look into it; renders incorrectly in pdf.js too"
   },
-  {
-    "id": "Type3WordSpacing",
-    "ignore": true,
-    "comment": "look into it"
-  },
-  {
-    "id": "ZapfDingbats",
-    "comment": "look into it"
-  },
+  "Type3WordSpacing",
+  "ZapfDingbats",
   {
     "id": "issue19800-eq",
     "ignore": true,
@@ -1402,9 +1404,7 @@
   {
     "id": "p020121130574743273239",
     "first_page": 0,
-    "last_page": 0,
-    "ignore": true,
-    "comment": "missing text (probably not-embedded font), page rotated wrongly"
+    "last_page": 0
   },
   {
     "id": "bug1782186",
@@ -1441,21 +1441,16 @@
     "last_page": 0,
     "comment": "doesnt parse / has encryption"
   },
-  {
-    "id": "filled-background-range",
-    "comment": "takes long time"
-  },
+  "filled-background-range",
   {
     "id": "issue17190",
     "ignore": true,
-    "comment": "takes long time"
+    "comment": "large jbig2 image, could benchmark target"
   },
   {
     "id": "issue17061",
     "first_page": 0,
-    "last_page": 4,
-    "ignore": true,
-    "comment": "takes long time"
+    "last_page": 4
   },
   "issue11242",
   {
@@ -1517,23 +1512,13 @@
     "last_page": 0,
     "comment": "widget annotation"
   },
-  {
-    "id": "issue18466",
-    "ignore": true,
-    "comment": "black rectangle, type0 without embedded font"
-  },
+  "issue18466",
   {
     "id": "issue16263",
     "ignore": true,
     "comment": "doesnt finish, lots of images/masks, needs caching?"
   },
-  {
-    "id": "issue16127",
-    "first_page": 0,
-    "last_page": 1,
-    "ignore": true,
-    "comment": "noto color emoji, some page doesnt finish"
-  },
+  "issue16127",
   "issue14462",
   "issue12295",
   "issue11768",

@@ -4,7 +4,7 @@ use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_interpret::font::{FontData, FontQuery, StandardFont};
 use hayro::hayro_interpret::hayro_cmap::CidFamily;
 use hayro::hayro_syntax::Pdf;
-use hayro::{RenderSettings, render};
+use hayro::{RenderCache, RenderSettings, render};
 use std::path::Path;
 use std::sync::Arc;
 use vello_cpu::color::palette::css::WHITE;
@@ -88,9 +88,10 @@ fn main() {
         bg_color: WHITE,
         ..Default::default()
     };
+    let cache = RenderCache::new();
 
     for (idx, page) in pdf.pages().iter().enumerate() {
-        let pixmap = render(page, &interpreter_settings, &render_settings);
+        let pixmap = render(page, &cache, &interpreter_settings, &render_settings);
         let output_path = format!("{}/rendered_{idx}.png", output_dir);
         std::fs::write(output_path, pixmap.into_png().unwrap()).unwrap();
     }

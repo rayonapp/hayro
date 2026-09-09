@@ -1,17 +1,25 @@
-use hayro_syntax::object::dict::keys::{BASE_STATE, D, OCGS, OCMD, OCPROPERTIES, OFF, ON, P, TYPE};
+use crate::Device;
+use hayro_syntax::object::dict::keys::{
+    BASE_STATE, D, OCG, OCGS, OCMD, OCPROPERTIES, OFF, ON, P, TYPE,
+};
 use hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier};
 use std::collections::HashSet;
 
 pub(crate) struct OcgState {
     inactive_ocgs: HashSet<ObjectIdentifier>,
-    visibility_stack: Vec<bool>,
+    content_stack: Vec<ContentScope>,
+}
+
+struct ContentScope {
+    process: bool,
+    optional_content: bool,
 }
 
 impl OcgState {
     fn dummy() -> Self {
         Self {
             inactive_ocgs: HashSet::default(),
-            visibility_stack: vec![],
+            content_stack: Vec::new(),
         }
     }
 
@@ -27,7 +35,7 @@ impl OcgState {
         let mut inactive = HashSet::new();
 
         let base_state = config
-            .get::<Name>(BASE_STATE)
+            .get::<Name<'_>>(BASE_STATE)
             .and_then(|b| BaseState::from_name(b.as_ref()));
 
         if base_state.unwrap_or(BaseState::On) == BaseState::Off
@@ -61,19 +69,13 @@ impl OcgState {
 
         Self {
             inactive_ocgs: inactive,
-            visibility_stack: Vec::new(),
+            content_stack: Vec::new(),
         }
     }
 
-    pub(crate) fn begin_single_oc(&mut self, ocg_id: ObjectIdentifier) {
-        let is_active = !self.inactive_ocgs.contains(&ocg_id);
-        let visible = self.is_visible() && is_active;
-        self.visibility_stack.push(visible);
-    }
-
-    pub(crate) fn begin_ocmd(&mut self, ocmd: &Dict<'_>) {
+    fn ocmd_is_visible(&self, ocmd: &Dict<'_>) -> bool {
         let policy = ocmd
-            .get::<Name>(P)
+            .get::<Name<'_>>(P)
             .and_then(|n| OcmdPolicy::from_name(n.as_ref()))
             .unwrap_or(OcmdPolicy::AnyOn);
 
@@ -89,7 +91,7 @@ impl OcgState {
             ocg_ids.push(ref_.into());
         }
 
-        let is_active = if ocg_ids.is_empty() {
+        if ocg_ids.is_empty() {
             true
         } else {
             match policy {
@@ -98,30 +100,51 @@ impl OcgState {
                 OcmdPolicy::AnyOff => ocg_ids.iter().any(|id| self.inactive_ocgs.contains(id)),
                 OcmdPolicy::AllOff => ocg_ids.iter().all(|id| self.inactive_ocgs.contains(id)),
             }
-        };
-
-        let visible = self.is_visible() && is_active;
-        self.visibility_stack.push(visible);
-    }
-
-    pub(crate) fn begin_ocg(&mut self, props: &Dict<'_>, ref_id: ObjectIdentifier) {
-        match props.get::<Name>(TYPE).as_deref() {
-            Some(OCMD) => self.begin_ocmd(props),
-            _ => self.begin_single_oc(ref_id),
         }
     }
 
+    pub(crate) fn begin_optional_content<'a>(
+        &mut self,
+        props: &Dict<'_>,
+        id: Option<ObjectIdentifier>,
+        device: &mut impl Device<'a>,
+    ) -> bool {
+        let visible = match props.get::<Name<'_>>(TYPE).as_deref() {
+            Some(OCMD) => self.ocmd_is_visible(props),
+            Some(OCG) => id.is_none_or(|id| !self.inactive_ocgs.contains(&id)),
+            _ => return false,
+        };
+
+        let process = device.begin_optional_content(id, props, visible);
+        self.content_stack.push(ContentScope {
+            process: self.should_process() && process,
+            optional_content: true,
+        });
+
+        true
+    }
+
     pub(crate) fn begin_marked_content(&mut self) {
-        let visible = self.is_visible();
-        self.visibility_stack.push(visible);
+        self.content_stack.push(ContentScope {
+            process: self.should_process(),
+            optional_content: false,
+        });
     }
 
-    pub(crate) fn end_marked_content(&mut self) {
-        self.visibility_stack.pop();
+    pub(crate) fn end_marked_content<'a>(&mut self, device: &mut impl Device<'a>) {
+        if let Some(scope) = self.content_stack.pop()
+            && scope.optional_content
+        {
+            device.end_optional_content();
+        }
     }
 
-    pub(crate) fn is_visible(&self) -> bool {
-        self.visibility_stack.last().copied().unwrap_or(true)
+    pub(crate) fn should_process(&self) -> bool {
+        self.content_stack.last().is_none_or(|scope| scope.process)
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.content_stack.len()
     }
 }
 

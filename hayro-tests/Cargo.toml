@@ -3,6 +3,7 @@ name = "hayro-tests"
 version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 readme.workspace = true
 license.workspace = true
@@ -18,11 +19,12 @@ name = "tests"
 path = "tests/mod.rs"
 
 [dependencies]
-hayro = { workspace = true, features = ["embed-cmaps"] }
+hayro = { workspace = true, features = ["embed-cmaps", "simd"] }
 hayro-cmap = { workspace = true }
 hayro-write = { workspace = true }
 hayro-svg = { workspace = true }
-hayro-syntax = { workspace = true }
+hayro-syntax = { workspace = true, features = ["std", "unsafe"] }
+hayro-jbig2 = { workspace = true }
 hayro-jpeg2000 = { workspace = true, features = ["image"] }
 pdf-writer = { workspace = true }
 image = { workspace = true, default-features = false}
@@ -33,7 +35,5 @@ memchr = { version = "2.7.6"}
 
 
 [dev-dependencies]
-once_cell = { workspace = true }
 hayro-syntax = { workspace = true }
 image = {  workspace = true }
-sitro = { workspace = true }

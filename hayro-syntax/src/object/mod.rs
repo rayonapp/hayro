@@ -13,7 +13,7 @@ pub use crate::object::stream::Stream;
 pub use crate::object::string::String;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
-use core::fmt::Debug;
+use core::fmt::{Debug, Display, Formatter};
 
 mod bool;
 mod date;
@@ -34,6 +34,11 @@ pub mod stream;
 /// A trait for PDF objects.
 pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Clone {}
 
+/// A trait for PDF objects that can be borrowed directly from an [`Object`].
+pub(crate) trait ObjectRefLike<'a>: Sized {
+    fn cast_ref<'b>(obj: &'b Object<'a>) -> Option<&'b Self>;
+}
+
 /// A primitive PDF object.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Object<'a> {
@@ -44,9 +49,9 @@ pub enum Object<'a> {
     /// A number object.
     Number(Number),
     /// A string object.
-    String(String),
+    String(String<'a>),
     /// A name object.
-    Name(Name),
+    Name(Name<'a>),
     /// A dict object.
     Dict(Dict<'a>),
     /// An array object.
@@ -55,6 +60,21 @@ pub enum Object<'a> {
     // Can only be an indirect object in theory and thus comes with some caveats,
     // but we just treat it the same.
     Stream(Stream<'a>),
+}
+
+impl Display for Object<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Null(value) => Display::fmt(value, f),
+            Self::Boolean(value) => Display::fmt(value, f),
+            Self::Number(value) => Display::fmt(value, f),
+            Self::String(value) => Display::fmt(value, f),
+            Self::Name(value) => Display::fmt(value, f),
+            Self::Dict(value) => Display::fmt(value, f),
+            Self::Array(value) => Display::fmt(value, f),
+            Self::Stream(value) => Display::fmt(value, f),
+        }
+    }
 }
 
 impl<'a> Object<'a> {
@@ -66,6 +86,14 @@ impl<'a> Object<'a> {
         self.try_into().ok()
     }
 
+    /// Try casting the object to a reference of the specific type.
+    pub(crate) fn cast_ref<T>(&self) -> Option<&T>
+    where
+        T: ObjectRefLike<'a>,
+    {
+        T::cast_ref(self)
+    }
+
     /// Try casting the object to a dict.
     #[inline(always)]
     pub fn into_dict(self) -> Option<Dict<'a>> {
@@ -74,7 +102,7 @@ impl<'a> Object<'a> {
 
     /// Try casting the object to a name.
     #[inline(always)]
-    pub fn into_name(self) -> Option<Name> {
+    pub fn into_name(self) -> Option<Name<'a>> {
         self.cast()
     }
 
@@ -92,7 +120,7 @@ impl<'a> Object<'a> {
 
     /// Try casting the object to a string.
     #[inline(always)]
-    pub fn into_string(self) -> Option<String> {
+    pub fn into_string(self) -> Option<String<'a>> {
         self.cast()
     }
 
@@ -140,6 +168,11 @@ impl<'a> Object<'a> {
 }
 
 impl<'a> ObjectLike<'a> for Object<'a> {}
+impl<'a> ObjectRefLike<'a> for Object<'a> {
+    fn cast_ref(obj: &Self) -> Option<&Self> {
+        Some(obj)
+    }
+}
 
 impl Skippable for Object<'_> {
     fn skip(r: &mut Reader<'_>, is_content_stream: bool) -> Option<()> {
@@ -246,9 +279,9 @@ impl Readable<'_> for ObjectIdentifier {
 
 impl Skippable for ObjectIdentifier {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        r.skip_in_content_stream::<i32>()?;
+        r.skip::<i32>(false)?;
         r.skip_white_spaces_and_comments();
-        r.skip_in_content_stream::<i32>()?;
+        r.skip::<i32>(false)?;
         r.skip_white_spaces_and_comments();
         r.forward_tag(b"obj")?;
 
@@ -260,11 +293,13 @@ impl Skippable for ObjectIdentifier {
 /// If the object is just a dictionary, it will return `None` for the stream.
 /// If the object is a stream, it will return its dictionary as well as the stream
 /// itself.
-pub fn dict_or_stream<'a>(obj: &Object<'a>) -> Option<(Dict<'a>, Option<Stream<'a>>)> {
-    if let Some(stream) = obj.clone().cast::<Stream<'a>>() {
-        Some((stream.dict().clone(), Some(stream)))
+pub fn dict_or_stream<'a, 'b>(
+    obj: &'b Object<'a>,
+) -> Option<(&'b Dict<'a>, Option<&'b Stream<'a>>)> {
+    if let Some(stream) = obj.cast_ref::<Stream<'a>>() {
+        Some((stream.dict(), Some(stream)))
     } else {
-        obj.clone().cast::<Dict<'a>>().map(|dict| (dict, None))
+        obj.cast_ref::<Dict<'a>>().map(|dict| (dict, None))
     }
 }
 
@@ -283,6 +318,15 @@ mod macros {
             }
 
             impl<'a> crate::object::ObjectLike<'a> for $t$(<$l>),* {}
+
+            impl<'a> crate::object::ObjectRefLike<'a> for $t$(<$l>),* {
+                fn cast_ref<'b>(obj: &'b crate::object::Object<'a>) -> Option<&'b Self> {
+                    match obj {
+                        crate::object::Object::$s(b) => Some(b),
+                        _ => None,
+                    }
+                }
+            }
         };
     }
 
@@ -352,15 +396,33 @@ mod tests {
     }
 
     #[test]
+    fn display() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"null", "null"),
+            (b"true", "true"),
+            (b"34.5", "34.5"),
+            (b"(Hi)", "\"Hi\""),
+            (b"/Name", "/Name"),
+            (b"[45]", "[45]"),
+            (b"<</Entry 45>>", "<< /Entry 45 >>"),
+            (b"<< /Length 3 >> stream\nabc\nendstream", "Stream (len: 3)"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(format!("{}", object_impl(input).unwrap()), *expected);
+        }
+    }
+
+    #[test]
     #[cfg(target_pointer_width = "64")]
     fn object_sizes() {
         assert_eq!(size_of::<Object<'_>>(), 40);
-        assert_eq!(size_of::<Array<'_>>(), 24);
+        assert_eq!(size_of::<Array<'_>>(), 32);
         assert_eq!(size_of::<Dict<'_>>(), 8);
-        assert_eq!(size_of::<Name>(), 32);
+        assert_eq!(size_of::<Name<'_>>(), 32);
         assert_eq!(size_of::<Null>(), 0);
         assert_eq!(size_of::<Number>(), 16);
-        assert_eq!(size_of::<Stream<'_>>(), 8);
-        assert_eq!(size_of::<String>(), 32);
+        assert_eq!(size_of::<Stream<'_>>(), 24);
+        assert_eq!(size_of::<String<'_>>(), 32);
     }
 }

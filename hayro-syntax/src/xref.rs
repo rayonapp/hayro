@@ -10,6 +10,7 @@ use crate::object::dict::keys::{
     AUTHOR, CREATION_DATE, CREATOR, ENCRYPT, FIRST, ID, INDEX, INFO, KEYWORDS, MOD_DATE, N,
     OCPROPERTIES, PAGES, PREV, PRODUCER, ROOT, SIZE, SUBJECT, TITLE, TYPE, VERSION, W, XREF_STM,
 };
+use crate::object::dict::probe_dict;
 use crate::object::indirect::IndirectObject;
 use crate::object::{Array, MaybeRef};
 use crate::object::{DateTime, Dict};
@@ -18,13 +19,15 @@ use crate::pdf::PdfVersion;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt};
 use crate::sync::{Arc, FxHashMap, RwLock, RwLockExt};
+use crate::trivia::is_white_space_character;
+use crate::util::findr_needle;
 use crate::{PdfData, object};
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::max;
 use core::iter;
 use core::ops::Deref;
-use log::{error, warn};
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
 
@@ -89,52 +92,82 @@ fn fallback_xref_map_inner<'a>(
 
         let mut old_r = r.clone();
 
-        if let Some(obj_id) = r.read::<ObjectIdentifier>(&dummy_ctx) {
-            let mut cloned = r.clone();
-            // Check that the object following it is actually valid before inserting it.
-            cloned.skip_white_spaces_and_comments();
-            if cloned.skip::<Object<'_>>(false).is_some() {
-                xref_map.insert(obj_id, EntryType::Normal(cur_pos));
-                last_obj_num = Some(obj_id);
-                dummy_ctx.set_obj_number(obj_id);
-            }
-        } else if let Some(dict) = r.read::<Dict<'_>>(&dummy_ctx) {
-            if dict.contains_key(ROOT) {
-                trailer_dicts.push(dict.clone());
-            }
-
-            if dict
-                .get::<Name>(TYPE)
-                .is_some_and(|n| n.as_str() == "Catalog")
-            {
-                root_ref = last_obj_num;
-            }
-
-            if let Some(stream) = old_r.read::<Stream<'_>>(&dummy_ctx)
-                && stream.dict().get::<Name>(TYPE).as_deref() == Some(b"ObjStm")
-                && let Some(data) = stream.decoded().ok()
-                && let Some(last_obj_num) = last_obj_num
-                && let Some(obj_stream) = ObjectStream::new(stream, &data, &dummy_ctx)
-            {
-                for (idx, (obj_num, _)) in obj_stream.offsets.iter().enumerate() {
-                    let id = ObjectIdentifier::new(*obj_num as i32, 0);
-                    // If we already found an entry for that object number that was not
-                    // inside an object stream. Somewhat arbitrary and maybe
-                    // we can do better, but that seems to work for the current
-                    // set of tests.
-                    if xref_map
-                        .get(&id)
-                        .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
-                    {
-                        xref_map.insert(
-                            id,
-                            EntryType::ObjStream(last_obj_num.obj_number as u32, idx as u32),
-                        );
-                    }
+        // First try to check if we have an object identifier.
+        if r.peek_byte().is_some_and(|b: u8| b.is_ascii_digit()) {
+            if let Some(obj_id) = r.read::<ObjectIdentifier>(&dummy_ctx) {
+                let mut cloned = r.clone();
+                // Check that the object following it is actually valid before inserting it.
+                cloned.skip_white_spaces_and_comments();
+                if cloned.skip::<Object<'_>>(false).is_some() {
+                    xref_map.insert(obj_id, EntryType::Normal(cur_pos));
+                    last_obj_num = Some(obj_id);
+                    dummy_ctx.set_obj_number(obj_id);
                 }
+            } else {
+                // There must be a white space before the next object number.
+                r.forward_while(|b| !is_white_space_character(b));
             }
         } else {
-            r.read_byte();
+            // Then, try to check whether we have a dictionary, in particular a trailer
+            // dictionary.
+            let mut probe_reader = r.clone();
+            if r.peek_bytes(2).is_some_and(|b| b == b"<<")
+                && let Some(probe) =
+                    { probe_dict(&mut probe_reader, &dummy_ctx, Some(b"<<"), b">>") }
+            {
+                r = probe_reader;
+                if probe.has_root || probe.has_type {
+                    let mut dict_reader = Reader::new(probe.data);
+                    if let Some(dict) = dict_reader.read_with_context::<Dict<'_>>(&dummy_ctx) {
+                        if probe.has_root && dict.contains_key(ROOT) {
+                            trailer_dicts.push(dict.clone());
+                        }
+
+                        if dict
+                            .get::<Name<'_>>(TYPE)
+                            .is_some_and(|n| n.as_str() == "Catalog")
+                        {
+                            root_ref = last_obj_num;
+                        }
+
+                        if let Some(stream) = old_r.read::<Stream<'_>>(&dummy_ctx)
+                            && dict.get::<Name<'_>>(TYPE).as_deref() == Some(b"ObjStm")
+                            && let Some(data) = stream.decoded().ok()
+                            && let Some(last_obj_num) = last_obj_num
+                            && let Some(obj_stream) = ObjectStream::new(stream, &data, &dummy_ctx)
+                        {
+                            for (idx, (obj_num, _)) in obj_stream.offsets.iter().enumerate() {
+                                let id = ObjectIdentifier::new(*obj_num as i32, 0);
+                                // If we already found an entry for that object number that was not
+                                // inside an object stream. Somewhat arbitrary and maybe
+                                // we can do better, but that seems to work for the current
+                                // set of tests.
+                                if xref_map
+                                    .get(&id)
+                                    .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
+                                {
+                                    xref_map.insert(
+                                        id,
+                                        EntryType::ObjStream(
+                                            last_obj_num.obj_number as u32,
+                                            idx as u32,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // We can skip everything until the next white space character,
+                // as there cannot possibly be any new dictionary/object identifier
+                // until then.
+                let old_pos = r.offset;
+                r.forward_while(|b| !is_white_space_character(b));
+                if r.offset == old_pos {
+                    r.read_byte();
+                }
+            }
         }
 
         if r.at_end() {
@@ -156,7 +189,10 @@ fn fallback_xref_map_inner<'a>(
 
                         if let Some(obj) =
                             reader.read_with_context::<IndirectObject<Dict<'_>>>(&dummy_ctx)
-                            && check(&obj.clone().get())
+                            && {
+                                let obj = obj.get();
+                                check(&obj)
+                            }
                         {
                             trailer_dict = Some(dict);
                         }
@@ -169,11 +205,18 @@ fn fallback_xref_map_inner<'a>(
 
                             if let Some(stream) =
                                 reader.read_with_context::<IndirectObject<Stream<'_>>>(&dummy_ctx)
-                                && let Some(data) = stream.clone().get().decoded().ok()
-                                && let Some(object_stream) =
-                                    ObjectStream::new(stream.get(), &data, &dummy_ctx)
-                                && let Some(obj) = object_stream.get::<Dict<'_>>(*idx)
-                                && check(&obj)
+                                && {
+                                    let stream = stream.get();
+                                    if let Some(data) = stream.decoded().ok()
+                                        && let Some(object_stream) =
+                                            ObjectStream::new(stream, &data, &dummy_ctx)
+                                        && let Some(obj) = object_stream.get::<Dict<'_>>(*idx)
+                                    {
+                                        check(&obj)
+                                    } else {
+                                        false
+                                    }
+                                }
                             {
                                 trailer_dict = Some(dict);
                             }
@@ -299,7 +342,7 @@ impl XRef {
                 let pages_ref = root.get_ref(PAGES).ok_or(XRefError::Unknown)?;
                 let has_ocgs = root.get::<Dict<'_>>(OCPROPERTIES).is_some();
                 let version = root
-                    .get::<Name>(VERSION)
+                    .get::<Name<'_>>(VERSION)
                     .and_then(|v| PdfVersion::from_bytes(v.deref()));
 
                 let td = TrailerData {
@@ -525,9 +568,7 @@ impl XRef {
                 } else {
                     // There is a valid object at the offset, it's just not of the type the caller
                     // expected, which is fine.
-                    if r.skip_not_in_content_stream::<IndirectObject<Object<'_>>>()
-                        .is_some()
-                    {
+                    if r.skip::<IndirectObject<Object<'_>>>(false).is_some() {
                         return None;
                     }
                 };
@@ -585,24 +626,13 @@ pub(crate) enum XRefInput<'a> {
 }
 
 pub(crate) fn find_last_xref_pos(data: &[u8]) -> Option<usize> {
-    let mut finder = Reader::new(data);
-    let mut pos = finder.len().checked_sub(1)?;
-    finder.jump(pos);
-
     let needle = b"startxref";
-
-    loop {
-        if finder.forward_tag(needle).is_some() {
-            finder.skip_white_spaces_and_comments();
-
-            let offset = finder.read_without_context::<i32>()?.try_into().ok()?;
-
-            return Some(offset);
-        }
-
-        pos = pos.checked_sub(1)?;
-        finder.jump(pos);
-    }
+    let pos = findr_needle(data, needle)?;
+    let mut finder = Reader::new(data);
+    finder.jump(pos);
+    finder.forward_tag(needle)?;
+    finder.skip_white_spaces_and_comments();
+    finder.read_without_context::<i32>()?.try_into().ok()
 }
 
 /// A type of xref entry.
@@ -700,6 +730,34 @@ impl XRefEntry {
 }
 
 fn populate_xref_impl<'a>(data: &'a [u8], pos: usize, xref_map: &mut XrefMap) -> Option<&'a [u8]> {
+    let mut visited = BTreeSet::new();
+    populate_xref_impl_inner(data, pos, xref_map, &mut visited)
+}
+
+/// Maximum number of allowed xref `Prev` pointers before we abort.
+const MAX_XREF_CHAIN_DEPTH: usize = 256;
+
+fn populate_xref_impl_inner<'a>(
+    data: &'a [u8],
+    pos: usize,
+    xref_map: &mut XrefMap,
+    visited: &mut BTreeSet<usize>,
+) -> Option<&'a [u8]> {
+    if !visited.insert(pos) {
+        warn!("circular xref PREV chain detected at offset {}", pos);
+
+        return None;
+    }
+
+    if visited.len() > MAX_XREF_CHAIN_DEPTH {
+        warn!(
+            "xref PREV chain exceeds maximum depth of {}",
+            MAX_XREF_CHAIN_DEPTH
+        );
+
+        return None;
+    }
+
     let mut reader = Reader::new(data);
     reader.jump(pos);
     // In case the position points to before the object number of a xref stream.
@@ -711,9 +769,9 @@ fn populate_xref_impl<'a>(data: &'a [u8], pos: usize, xref_map: &mut XrefMap) ->
         .read_without_context::<ObjectIdentifier>()
         .is_some()
     {
-        populate_from_xref_stream(data, &mut r2, xref_map)
+        populate_from_xref_stream(data, &mut r2, xref_map, visited)
     } else {
-        populate_from_xref_table(data, &mut r2, xref_map)
+        populate_from_xref_table(data, &mut r2, xref_map, visited)
     }
 }
 
@@ -739,6 +797,7 @@ fn populate_from_xref_table<'a>(
     data: &'a [u8],
     reader: &mut Reader<'a>,
     insert_map: &mut XrefMap,
+    visited: &mut BTreeSet<usize>,
 ) -> Option<&'a [u8]> {
     let trailer = {
         let mut reader = reader.clone();
@@ -753,20 +812,20 @@ fn populate_from_xref_table<'a>(
 
     if let Some(prev) = trailer.get::<i32>(PREV) {
         // First insert the entries from any previous xref tables.
-        populate_xref_impl(data, prev as usize, insert_map)?;
+        populate_xref_impl_inner(data, prev as usize, insert_map, visited)?;
     }
 
     // In hybrid files, entries in `XRefStm` should have higher priority, therefore we insert them
     // after looking at `PREV`.
     if let Some(xref_stm) = trailer.get::<i32>(XREF_STM) {
-        populate_xref_impl(data, xref_stm as usize, insert_map)?;
+        populate_xref_impl_inner(data, xref_stm as usize, insert_map, visited)?;
     }
 
     while let Some(header) = reader.read_without_context::<SubsectionHeader>() {
         reader.skip_white_spaces();
 
         let start = header.start;
-        let end = start + header.num_entries;
+        let end = start.checked_add(header.num_entries)?;
 
         for obj_number in start..end {
             max_obj = max(max_obj, obj_number);
@@ -791,6 +850,7 @@ fn populate_from_xref_stream<'a>(
     data: &'a [u8],
     reader: &mut Reader<'a>,
     insert_map: &mut XrefMap,
+    visited: &mut BTreeSet<usize>,
 ) -> Option<&'a [u8]> {
     let stream = reader
         .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy())?
@@ -798,7 +858,7 @@ fn populate_from_xref_stream<'a>(
 
     if let Some(prev) = stream.dict().get::<i32>(PREV) {
         // First insert the entries from any previous xref tables.
-        let _ = populate_xref_impl(data, prev as usize, insert_map)?;
+        let _ = populate_xref_impl_inner(data, prev as usize, insert_map, visited)?;
     }
 
     let size = stream.dict().get::<u32>(SIZE)?;
@@ -864,8 +924,8 @@ fn xref_stream_num(data: &[u8]) -> Option<u32> {
                 return None;
             }
         }
-        n => {
-            warn!("invalid xref stream number {n}");
+        _n => {
+            warn!("invalid xref stream number {_n}");
 
             return None;
         }
@@ -954,7 +1014,8 @@ fn read_xref_table_trailer<'a>(
     reader.skip_white_spaces();
 
     while let Some(header) = reader.read_without_context::<SubsectionHeader>() {
-        reader.jump(reader.offset() + XREF_ENTRY_LEN * header.num_entries as usize);
+        let len = XREF_ENTRY_LEN.checked_mul(header.num_entries as usize)?;
+        reader.jump(reader.offset().checked_add(len)?);
     }
 
     reader.skip_white_spaces();
@@ -968,7 +1029,7 @@ fn get_decryptor(trailer_dict: &Dict<'_>, password: &[u8]) -> Result<Decryptor, 
     if let Some(encryption_dict) = trailer_dict.get::<Dict<'_>>(ENCRYPT) {
         let id = if let Some(id) = trailer_dict
             .get::<Array<'_>>(ID)
-            .and_then(|a| a.flex_iter().next::<object::String>())
+            .and_then(|a| a.flex_iter().next::<object::String<'_>>())
         {
             id.to_vec()
         } else {
@@ -1028,20 +1089,66 @@ impl<'a> ObjectStream<'a> {
 fn parse_metadata(info_dict: &Dict<'_>) -> Metadata {
     Metadata {
         creation_date: info_dict
-            .get::<object::String>(CREATION_DATE)
+            .get::<object::String<'_>>(CREATION_DATE)
             .and_then(|c| DateTime::from_bytes(&c)),
         modification_date: info_dict
-            .get::<object::String>(MOD_DATE)
+            .get::<object::String<'_>>(MOD_DATE)
             .and_then(|c| DateTime::from_bytes(&c)),
-        title: info_dict.get::<object::String>(TITLE).map(|t| t.to_vec()),
-        author: info_dict.get::<object::String>(AUTHOR).map(|t| t.to_vec()),
-        subject: info_dict.get::<object::String>(SUBJECT).map(|t| t.to_vec()),
+        title: info_dict
+            .get::<object::String<'_>>(TITLE)
+            .map(|t| t.to_vec()),
+        author: info_dict
+            .get::<object::String<'_>>(AUTHOR)
+            .map(|t| t.to_vec()),
+        subject: info_dict
+            .get::<object::String<'_>>(SUBJECT)
+            .map(|t| t.to_vec()),
         keywords: info_dict
-            .get::<object::String>(KEYWORDS)
+            .get::<object::String<'_>>(KEYWORDS)
             .map(|t| t.to_vec()),
-        creator: info_dict.get::<object::String>(CREATOR).map(|t| t.to_vec()),
+        creator: info_dict
+            .get::<object::String<'_>>(CREATOR)
+            .map(|t| t.to_vec()),
         producer: info_dict
-            .get::<object::String>(PRODUCER)
+            .get::<object::String<'_>>(PRODUCER)
             .map(|t| t.to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn circular_prev_chain() {
+        let mut pdf = b"%PDF-1.0\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec();
+        let expected_xref_pos = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n\
+                 0 1\n\
+                 0000000000 65535 f \r\n\
+                 trailer\n<< /Size 1 /Root 1 0 R /Prev {expected_xref_pos} >>\n\
+                 startxref\n{expected_xref_pos}\n%%EOF"
+            )
+            .as_bytes(),
+        );
+
+        let mut xref_map = FxHashMap::default();
+        let xref_pos = find_last_xref_pos(pdf.as_ref()).unwrap();
+        let _result = populate_xref_impl(pdf.as_ref(), xref_pos, &mut xref_map);
+    }
+
+    #[test]
+    fn find_last_xref_uses_last_startxref() {
+        let pdf = b"%PDF-1.0\nstartxref\n5\n%%EOF\nstartxref\n42\n%%EOF";
+        assert_eq!(find_last_xref_pos(pdf), Some(42));
+    }
+
+    #[test]
+    fn xref_table_trailer_rejects_overflowing_entry_skip() {
+        let data = b"xref\n0 999999999999999999999\ntrailer\n<<>>";
+        let mut reader = Reader::new(data);
+        assert!(read_xref_table_trailer(&mut reader, &ReaderContext::dummy()).is_none());
     }
 }

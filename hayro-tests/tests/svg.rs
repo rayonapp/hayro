@@ -61,6 +61,16 @@ fn pdfbox_5795() {
 }
 
 #[test]
+fn pdfbox_6024() {
+    run_svg_test("pdfbox_6024", "downloads/pdfbox/6024.pdf", None);
+}
+
+#[test]
+fn pdfbox_3000_3() {
+    run_svg_test("pdfbox_3000_3", "downloads/pdfbox/3000_3.pdf", None);
+}
+
+#[test]
 fn image_interpolate() {
     run_svg_test(
         "image_interpolate",
@@ -134,6 +144,11 @@ fn pattern_tiling_rotated() {
 }
 
 #[test]
+fn pdfium_41480161() {
+    run_svg_test("pdfium_41480161", "downloads/pdfium/41480161.pdf", None);
+}
+
+#[test]
 fn mask_luminance() {
     run_svg_test(
         "mask_luminance",
@@ -190,6 +205,16 @@ fn font_type3_stroked_glyphs() {
 #[test]
 fn pdfjs_issue13372() {
     run_svg_test("pdfjs_issue13372", "downloads/pdfjs/issue13372.pdf", None);
+}
+
+#[test]
+fn pdfjs_issue2177() {
+    run_svg_test("pdfjs_issue2177", "downloads/pdfjs/issue2177.pdf", None);
+}
+
+#[test]
+fn pdfjs_issue8565() {
+    run_svg_test("pdfjs_issue8565", "downloads/pdfjs/issue8565.pdf", None);
 }
 
 #[test]

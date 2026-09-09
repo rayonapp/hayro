@@ -7,17 +7,22 @@ use crate::object::{Object, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
-use crate::sync::HashMap;
-use crate::xref::XRef;
+use crate::sync::FxHashMap;
 use alloc::format;
 use alloc::vec::Vec;
-use core::fmt::{Debug, Formatter};
+use core::fmt::{Debug, Display, Formatter};
 use core::ops::Deref;
 
 /// A dictionary, which is a key-value map, keys being names, and values being any PDF object or
 /// objetc reference.
 #[derive(Clone)]
-pub struct Dict<'a>(Arc<Repr<'a>>);
+pub struct Dict<'a>(Inner<'a>);
+
+#[derive(Clone)]
+enum Inner<'a> {
+    Empty,
+    Some(Arc<Repr<'a>>),
+}
 
 impl Default for Dict<'_> {
     fn default() -> Self {
@@ -29,40 +34,38 @@ impl Default for Dict<'_> {
 // items are still considered different if they have different whitespaces.
 impl PartialEq for Dict<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.data == other.0.data
+        self.data() == other.data()
     }
 }
 
 impl<'a> Dict<'a> {
     /// Create a new empty dictionary.
     pub fn empty() -> Self {
-        let repr = Repr {
-            data: &[],
-            offsets: HashMap::new(),
-            ctx: ReaderContext::new(XRef::dummy(), false),
-        };
-
-        Self(Arc::new(repr))
+        Self(Inner::Empty)
     }
 
     /// Get the raw bytes underlying to the dictionary.
     pub fn data(&self) -> &'a [u8] {
-        self.0.data
+        match &self.0 {
+            Inner::Empty => &[],
+            Inner::Some(repr) => repr.data,
+        }
     }
 
     /// Returns the number of entries in the dictionary.
     pub fn len(&self) -> usize {
-        self.0.offsets.len()
+        self.offsets().map_or(0, FxHashMap::len)
     }
 
     /// Return whether the dictionary is empty.
     pub fn is_empty(&self) -> bool {
-        self.0.offsets.is_empty()
+        self.offsets().is_none_or(FxHashMap::is_empty)
     }
 
     /// Checks whether the dictionary contains an entry with a specific key.
-    pub fn contains_key(&self, key: impl Deref<Target = [u8]>) -> bool {
-        self.0.offsets.contains_key(key.deref())
+    pub fn contains_key(&self, key: impl AsRef<[u8]>) -> bool {
+        self.offsets()
+            .is_some_and(|offsets| offsets.contains_key(key.as_ref()))
     }
 
     /// Returns the entry of a key as a specific object, or try to resolve it in case it's
@@ -71,27 +74,29 @@ impl<'a> Dict<'a> {
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
     )]
-    pub fn get<T>(&self, key: impl Deref<Target = [u8]>) -> Option<T>
+    pub fn get<T>(&self, key: impl AsRef<[u8]>) -> Option<T>
     where
         T: ObjectLike<'a>,
     {
-        self.get_raw::<T>(key.as_ref())?.resolve(&self.0.ctx)
+        self.get_raw::<T>(key.as_ref())?.resolve(self.ctx())
     }
 
     /// Get the object reference linked to a key.
-    pub fn get_ref(&self, key: impl Deref<Target = [u8]>) -> Option<ObjRef> {
-        let offset = *self.0.offsets.get(key.deref())?;
+    pub fn get_ref(&self, key: impl AsRef<[u8]>) -> Option<ObjRef> {
+        let offset = *self.offsets()?.get(key.as_ref())?;
 
-        Reader::new(&self.0.data[offset..]).read_with_context::<ObjRef>(&self.0.ctx)
+        Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
     }
 
     /// Returns an iterator over all keys in the dictionary.
-    pub fn keys(&self) -> impl Iterator<Item = Name> + '_ {
-        self.0.offsets.keys().cloned()
+    pub fn keys(&self) -> impl Iterator<Item = Name<'a>> + '_ {
+        self.offsets()
+            .into_iter()
+            .flat_map(|offsets| offsets.keys().cloned())
     }
 
     /// An iterator over all entries in the dictionary, sorted by key.
-    pub fn entries(&self) -> impl Iterator<Item = (Name, MaybeRef<Object<'a>>)> + '_ {
+    pub fn entries(&self) -> impl Iterator<Item = (Name<'a>, MaybeRef<Object<'a>>)> + '_ {
         let mut sorted_keys = self.keys().collect::<Vec<_>>();
         sorted_keys.sort_by(|n1, n2| n1.as_ref().cmp(n2.as_ref()));
         sorted_keys.into_iter().map(|k| {
@@ -102,39 +107,69 @@ impl<'a> Dict<'a> {
 
     /// Return the object identifier of the dict, if it's an indirect object.
     pub fn obj_id(&self) -> Option<ObjectIdentifier> {
-        self.0.ctx.obj_number()
+        self.ctx().obj_number()
     }
 
     /// Return the raw entry for a specific key.
     #[allow(private_bounds)]
-    pub fn get_raw<T>(&self, key: impl Deref<Target = [u8]>) -> Option<MaybeRef<T>>
+    pub fn get_raw<T>(&self, key: impl AsRef<[u8]>) -> Option<MaybeRef<T>>
     where
         T: Readable<'a>,
     {
-        let offset = *self.0.offsets.get(key.deref())?;
+        let offset = *self.offsets()?.get(key.as_ref())?;
 
-        Reader::new(&self.0.data[offset..]).read_with_context::<MaybeRef<T>>(&self.0.ctx)
+        Reader::new(&self.data()[offset..]).read_with_context::<MaybeRef<T>>(self.ctx())
     }
 
     pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
-        &self.0.ctx
+        match &self.0 {
+            Inner::Empty => ReaderContext::dummy_ref(),
+            Inner::Some(repr) => &repr.ctx,
+        }
+    }
+
+    fn offsets(&self) -> Option<&FxHashMap<Name<'a>, usize>> {
+        match &self.0 {
+            Inner::Empty => None,
+            Inner::Some(repr) => Some(&repr.offsets),
+        }
     }
 }
 
 impl Debug for Dict<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        let mut r = Reader::new(self.0.data);
         let mut debug_struct = f.debug_struct("Dict");
 
-        for (key, val) in &self.0.offsets {
-            r.jump(*val);
-            debug_struct.field(
-                &format!("{:?}", key.as_str()),
-                &r.read_with_context::<MaybeRef<Object<'_>>>(&ReaderContext::dummy())
-                    .unwrap(),
-            );
+        if let Some(offsets) = self.offsets() {
+            let mut r = Reader::new(self.data());
+
+            for (key, val) in offsets {
+                r.jump(*val);
+                debug_struct.field(
+                    &format!("{:?}", key.as_str()),
+                    &r.read_with_context::<MaybeRef<Object<'_>>>(&ReaderContext::dummy())
+                        .unwrap(),
+                );
+            }
         }
-        Ok(())
+
+        debug_struct.finish()
+    }
+}
+
+impl Display for Dict<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.write_str("<<")?;
+        for (key, value) in self.entries() {
+            f.write_str(" ")?;
+            Display::fmt(&key, f)?;
+            f.write_str(" ")?;
+            Display::fmt(&value, f)?;
+        }
+        if !self.is_empty() {
+            f.write_str(" ")?;
+        }
+        f.write_str(">>")
     }
 }
 
@@ -148,7 +183,7 @@ impl Skippable for Dict<'_> {
             if let Some(()) = r.forward_tag(b">>") {
                 break Some(());
             } else {
-                let Some(_) = r.skip::<Name>(is_content_stream) else {
+                let Some(_) = r.skip::<Name<'_>>(is_content_stream) else {
                     // In case there is garbage in-between, be lenient and just try to skip it.
                     r.skip::<Object<'_>>(is_content_stream)?;
                     continue;
@@ -178,71 +213,141 @@ fn read_inner<'a>(
     start_tag: Option<&[u8]>,
     end_tag: &[u8],
 ) -> Option<Dict<'a>> {
-    let mut offsets = HashMap::new();
+    // TODO: Figure out how to
+    // 1) Make dictionaries easily cloneable without wrapping in Arc.
+    // 2) Maybe have an efficient per-document allocator pool for hashmaps
+    // that can be reused.
+    #[cfg(feature = "std")]
+    let mut offsets = FxHashMap::with_capacity_and_hasher(8, rustc_hash::FxBuildHasher);
+    #[cfg(not(feature = "std"))]
+    let mut offsets = FxHashMap::new();
 
-    let data = {
-        let dict_data = r.tail()?;
-        let start_offset = r.offset();
+    let data = parse_dict_with(
+        r,
+        ctx,
+        start_tag,
+        end_tag,
+        #[inline]
+        |name, offset, _| {
+            offsets.insert(name, offset);
+            Some(())
+        },
+    )?;
 
-        // Inline image dictionaries don't start with '<<'.
-        if let Some(start_tag) = start_tag {
-            r.forward_tag(start_tag)?;
-        }
-
-        loop {
-            r.skip_white_spaces_and_comments();
-
-            // Normal dictionaries end with '>>', inline image dictionaries end with BD.
-            if let Some(()) = r.peek_tag(end_tag) {
-                r.forward_tag(end_tag)?;
-                let end_offset = r.offset() - start_offset;
-
-                break &dict_data[..end_offset];
-            } else {
-                let Some(name) = r.read_without_context::<Name>() else {
-                    if start_tag.is_some() {
-                        // In case there is garbage in-between, be lenient and just try to skip it.
-                        // But only do this if we are parsing a proper dictionary as opposed to an
-                        // inline dictionary.
-                        r.read::<Object<'_>>(ctx)?;
-                        continue;
-                    } else {
-                        return None;
-                    }
-                };
-                r.skip_white_spaces_and_comments();
-
-                // Do note that we are including objects in our dictionary even if they
-                // are the null object, meaning that a call to `contains_key` will return `true`
-                // even if the object is the null object. The PDF reference in theory requires
-                // us to treat them as non-existing. Previously, we included a check to determine
-                // whether the object is `null` before inserting it, but that caused problems
-                // in some test cases where encryption + object streams are involved (as we would
-                // attempt to read an object stream before having resolved the encryption dictionary).
-                let offset = r.offset() - start_offset;
-                offsets.insert(name, offset);
-
-                if ctx.in_content_stream() {
-                    r.skip::<Object<'_>>(ctx.in_content_stream())?;
-                } else {
-                    r.skip::<MaybeRef<Object<'_>>>(ctx.in_content_stream())?;
-                }
-            }
-        }
-    };
-
-    Some(Dict(Arc::new(Repr {
+    Some(Dict(Inner::Some(Arc::new(Repr {
         data,
         offsets,
         ctx: ctx.clone(),
-    })))
+    }))))
+}
+
+pub(crate) struct DictProbe<'a> {
+    pub(crate) data: &'a [u8],
+    pub(crate) has_root: bool,
+    pub(crate) has_type: bool,
+}
+
+// We use that method during fallback xref parsing, so that we can search for
+// the dictionaries we need without allocating the whole hash map.
+// If the above TODOs are ever resolved, we can probably remove this method.
+pub(crate) fn probe_dict<'a>(
+    r: &mut Reader<'a>,
+    ctx: &ReaderContext<'a>,
+    start_tag: Option<&[u8]>,
+    end_tag: &[u8],
+) -> Option<DictProbe<'a>> {
+    let mut has_root = false;
+    let mut has_type = false;
+
+    let data = parse_dict_with(
+        r,
+        ctx,
+        start_tag,
+        end_tag,
+        #[inline]
+        |name, _, _value_reader| {
+            if name.as_ref() == keys::ROOT {
+                has_root = true;
+            } else if name.as_ref() == keys::TYPE {
+                has_type = true;
+            }
+
+            Some(())
+        },
+    )?;
+
+    Some(DictProbe {
+        data,
+        has_root,
+        has_type,
+    })
+}
+
+fn parse_dict_with<'a, F>(
+    r: &mut Reader<'a>,
+    ctx: &ReaderContext<'a>,
+    start_tag: Option<&[u8]>,
+    end_tag: &[u8],
+    mut on_entry: F,
+) -> Option<&'a [u8]>
+where
+    F: FnMut(Name<'a>, usize, &Reader<'a>) -> Option<()>,
+{
+    let dict_data = r.tail()?;
+    let start_offset = r.offset();
+
+    // Inline image dictionaries don't start with '<<'.
+    if let Some(start_tag) = start_tag {
+        r.forward_tag(start_tag)?;
+    }
+
+    loop {
+        r.skip_white_spaces_and_comments();
+
+        // Normal dictionaries end with '>>', inline image dictionaries end with BD.
+        if let Some(()) = r.peek_tag(end_tag) {
+            r.forward_tag(end_tag)?;
+            let end_offset = r.offset() - start_offset;
+
+            break Some(&dict_data[..end_offset]);
+        } else {
+            let Some(name) = r.read_without_context::<Name<'_>>() else {
+                if start_tag.is_some() {
+                    // In case there is garbage in-between, be lenient and just try to skip it.
+                    // But only do this if we are parsing a proper dictionary as opposed to an
+                    // inline dictionary.
+                    r.read::<Object<'_>>(ctx)?;
+                    continue;
+                } else {
+                    return None;
+                }
+            };
+            r.skip_white_spaces_and_comments();
+
+            let offset = r.offset() - start_offset;
+            // Do note that we are including objects in our dictionary even if they
+            // are the null object, meaning that a call to `contains_key` will return `true`
+            // even if the object is the null object. The PDF reference in theory requires
+            // us to treat them as non-existing. Previously, we included a check to determine
+            // whether the object is `null` before inserting it, but that caused problems
+            // in some test cases where encryption + object streams are involved (as we would
+            // attempt to read an object stream before having resolved the encryption dictionary).
+            on_entry(name, offset, r)?;
+
+            if ctx.in_content_stream() {
+                r.skip::<Object<'_>>(ctx.in_content_stream())?;
+            } else {
+                r.skip::<MaybeRef<Object<'_>>>(ctx.in_content_stream())?;
+            }
+        }
+    }
 }
 
 object!(Dict<'a>, Dict);
 
 struct Repr<'a> {
     data: &'a [u8],
-    offsets: HashMap<Name, usize>,
+    offsets: FxHashMap<Name<'a>, usize>,
     ctx: ReaderContext<'a>,
 }
 
@@ -915,10 +1020,10 @@ pub mod keys {
 
 #[cfg(test)]
 mod tests {
-    use crate::object::Number;
     use crate::object::dict::keys::{COLORSPACE, EXT_G_STATE, FONT, PROC_SET};
     use crate::object::dict::{Dict, InlineImageDict};
     use crate::object::string;
+    use crate::object::{FromBytes, Number};
     use crate::object::{Name, ObjRef};
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
@@ -949,7 +1054,7 @@ mod tests {
         let dict = dict_impl(dict_data).unwrap();
 
         assert_eq!(dict.len(), 1);
-        assert!(dict.get::<Number>(Name::new(b"Hi")).is_some());
+        assert!(dict.get::<Number>(Name::new_unescaped(b"Hi")).is_some());
     }
 
     #[test]
@@ -958,8 +1063,8 @@ mod tests {
         let dict = dict_impl(dict_data).unwrap();
 
         assert_eq!(dict.len(), 2);
-        assert!(dict.get::<Number>(Name::new(b"Hi")).is_some());
-        assert!(dict.get::<bool>(Name::new(b"Second")).is_some());
+        assert!(dict.get::<Number>(Name::new_unescaped(b"Hi")).is_some());
+        assert!(dict.get::<bool>(Name::new_unescaped(b"Second")).is_some());
     }
 
     #[test]
@@ -980,15 +1085,27 @@ mod tests {
             .read_with_context::<Dict<'_>>(&ReaderContext::dummy())
             .unwrap();
         assert_eq!(dict.len(), 6);
-        assert!(dict.get::<Name>(Name::new(b"Type")).is_some());
-        assert!(dict.get::<Name>(Name::new(b"Subtype")).is_some());
-        assert!(dict.get::<Number>(Name::new(b"Version")).is_some());
-        assert!(dict.get::<i32>(Name::new(b"IntegerItem")).is_some());
+        assert!(dict.get::<Name<'_>>(Name::new_unescaped(b"Type")).is_some());
         assert!(
-            dict.get::<string::String>(Name::new(b"StringItem"))
+            dict.get::<Name<'_>>(Name::new_unescaped(b"Subtype"))
                 .is_some()
         );
-        assert!(dict.get::<Dict<'_>>(Name::new(b"Subdictionary")).is_some());
+        assert!(
+            dict.get::<Number>(Name::new_unescaped(b"Version"))
+                .is_some()
+        );
+        assert!(
+            dict.get::<i32>(Name::new_unescaped(b"IntegerItem"))
+                .is_some()
+        );
+        assert!(
+            dict.get::<string::String<'_>>(Name::new_unescaped(b"StringItem"))
+                .is_some()
+        );
+        assert!(
+            dict.get::<Dict<'_>>(Name::new_unescaped(b"Subdictionary"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -1023,7 +1140,7 @@ mod tests {
         let dict_data = b"<< /PANTONE#20104#20C 234 >>";
         let dict = dict_impl(dict_data).unwrap();
 
-        assert!(dict.contains_key(b"PANTONE 104 C".as_ref()));
+        assert!(dict.contains_key("PANTONE 104 C"));
     }
 
     #[test]
@@ -1047,7 +1164,25 @@ mod tests {
             panic!("failed to parse ext g state");
         };
 
-        assert_eq!(dict.get_ref("GS2".as_ref()), Some(ObjRef::new(14, 0)));
-        assert_eq!(dict.get_ref("GS3".as_ref()), Some(ObjRef::new(15, 0)));
+        assert_eq!(dict.get_ref("GS2"), Some(ObjRef::new(14, 0)));
+        assert_eq!(dict.get_ref("GS3"), Some(ObjRef::new(15, 0)));
+    }
+
+    #[test]
+    fn dict_repr() {
+        let dict = Dict::from_bytes(b"<< /Hi 34 >>").unwrap();
+
+        assert_eq!(
+            format!("{dict:?}"),
+            "Dict { \"Hi\": Number(Number(Integer(34))) }"
+        );
+    }
+
+    #[test]
+    fn display() {
+        let dict = Dict::from_bytes(b"<< /B [1   2] % comment\n /A << /X   true >> >>").unwrap();
+
+        assert_eq!(format!("{dict}"), "<< /A << /X true >> /B [1 2] >>");
+        assert_eq!(format!("{}", Dict::empty()), "<<>>");
     }
 }

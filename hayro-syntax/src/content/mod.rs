@@ -34,23 +34,31 @@ assert!(matches!(iter.next(), Some(TypedInstruction::FillPathNonZero(_))));
 pub mod ops;
 
 use crate::content::ops::TypedInstruction;
-use crate::object::Stream;
+use crate::object;
 use crate::object::dict::InlineImageDict;
 use crate::object::name::{Name, skip_name_like};
-use crate::object::{Object, ObjectLike};
+use crate::object::{Array, Null, Number, Object, Stream};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
-use core::fmt::{Debug, Formatter};
+use crate::trivia::is_white_space_character;
+use crate::util::find_needle;
+use core::array;
+use core::fmt::{Debug, Display, Formatter};
 use core::ops::Deref;
-use log::warn;
 use smallvec::SmallVec;
 
 // 6 operands are used for example for ctm or cubic curves,
 // but anything above should be pretty rare (only for example for
-// DeviceN color spaces)
-const OPERANDS_THRESHOLD: usize = 6;
+// DeviceN color spaces, or invalid PDF files). So we settle on 10.
+const OPERANDS_THRESHOLD: usize = 10;
 
-impl Debug for Operator {
+impl Debug for Operator<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0.as_str())
+    }
+}
+
+impl Display for Operator<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0.as_str())
     }
@@ -58,9 +66,9 @@ impl Debug for Operator {
 
 /// A content stream operator.
 #[derive(Clone, PartialEq)]
-pub struct Operator(Name);
+pub struct Operator<'a>(Name<'a>);
 
-impl Deref for Operator {
+impl Deref for Operator<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -68,14 +76,14 @@ impl Deref for Operator {
     }
 }
 
-impl Skippable for Operator {
+impl Skippable for Operator<'_> {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
         skip_name_like(r, false).map(|_| ())
     }
 }
 
-impl Readable<'_> for Operator {
-    fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
+impl<'a> Readable<'a> for Operator<'a> {
+    fn read(r: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
         let start = r.offset();
         skip_name_like(r, false)?;
         let end = r.offset();
@@ -85,7 +93,7 @@ impl Readable<'_> for Operator {
             return None;
         }
 
-        Some(Self(Name::new(data)))
+        Some(Self(Name::new(data)?))
     }
 }
 
@@ -94,6 +102,7 @@ impl Readable<'_> for Operator {
 pub struct UntypedIter<'a> {
     reader: Reader<'a>,
     stack: Stack<'a>,
+    operator: Option<Operator<'a>>,
 }
 
 impl<'a> UntypedIter<'a> {
@@ -102,6 +111,7 @@ impl<'a> UntypedIter<'a> {
         Self {
             reader: Reader::new(data),
             stack: Stack::new(),
+            operator: None,
         }
     }
 
@@ -110,15 +120,15 @@ impl<'a> UntypedIter<'a> {
         Self {
             reader: Reader::new(&[]),
             stack: Stack::new(),
+            operator: None,
         }
     }
-}
 
-impl<'a> Iterator for UntypedIter<'a> {
-    type Item = Instruction<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Return the next instruction.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Instruction<'_, 'a>> {
         self.stack.clear();
+        self.operator = None;
 
         self.reader.skip_white_spaces_and_comments();
 
@@ -136,14 +146,14 @@ impl<'a> Iterator for UntypedIter<'a> {
                 // similar behavior to Acrobat and Chromium, we try to consume
                 // such an operator and then simply skip it.
                 if let Some(object) = self.reader.read_without_context::<Object<'_>>() {
-                    self.stack.push(object);
-                } else if self.reader.read_without_context::<Operator>().is_some() {
+                    self.stack.push(object)?;
+                } else if self.reader.read_without_context::<Operator<'_>>().is_some() {
                     self.stack.clear();
                 } else {
                     return None;
                 }
             } else {
-                let operator = match self.reader.read_without_context::<Operator>() {
+                let operator = match self.reader.read_without_context::<Operator<'_>>() {
                     Some(o) => o,
                     None => {
                         warn!("failed to read operator in content stream");
@@ -165,8 +175,21 @@ impl<'a> Iterator for UntypedIter<'a> {
                     let stream_data = self.reader.tail()?;
                     let start_offset = self.reader.offset();
 
-                    'outer: while let Some(bytes) = self.reader.peek_bytes(2) {
-                        if bytes == b"EI" {
+                    'outer: while let Some(pos) = find_needle(self.reader.tail()?, b"EI") {
+                        self.reader.read_bytes(pos)?;
+
+                        if self.reader.peek_bytes(2) == Some(b"EI") {
+                            // If the following character is not a whitespace character, then we are in a ASCII-85 stream.
+                            if self
+                                .reader
+                                .peek_bytes(3)
+                                .is_some_and(|b| !is_white_space_character(b[2]))
+                            {
+                                self.reader.read_bytes(3)?;
+
+                                continue;
+                            }
+
                             let end_offset = self.reader.offset() - start_offset;
                             let image_data = &stream_data[..end_offset];
 
@@ -181,9 +204,23 @@ impl<'a> Iterator for UntypedIter<'a> {
                             let tail = &self.reader.tail()?[2..];
                             let mut find_reader = Reader::new(tail);
 
-                            while let Some(bytes) = find_reader.peek_bytes(2) {
-                                if bytes == b"EI" {
-                                    let analyze_data = &tail;
+                            while !find_reader.at_end() {
+                                let remaining = find_reader.tail()?;
+                                let next_ei = find_needle(remaining, b"EI");
+                                let next_bi = find_needle(remaining, b"BI");
+
+                                let (next_pos, is_ei) = match (next_ei, next_bi) {
+                                    (Some(ei), Some(bi)) if ei <= bi => (ei, true),
+                                    (Some(_), Some(bi)) => (bi, false),
+                                    (Some(ei), None) => (ei, true),
+                                    (None, Some(bi)) => (bi, false),
+                                    (None, None) => break,
+                                };
+
+                                find_reader.read_bytes(next_pos)?;
+
+                                if is_ei {
+                                    let analyze_data = &tail[..find_reader.offset()];
 
                                     // If there is any binary data in-between, we for sure
                                     // have not reached the end.
@@ -200,10 +237,11 @@ impl<'a> Iterator for UntypedIter<'a> {
                                     // stream and there should be at least one text-related
                                     // operator that can be parsed correctly.
 
-                                    let iter = TypedIter::new(tail);
+                                    let mut iter = TypedIter::new(tail);
                                     let mut found = false;
+                                    let mut counter = 0;
 
-                                    for (counter, op) in iter.enumerate() {
+                                    while let Some(op) = iter.next() {
                                         // If we have read more than 20 valid operators, it should be
                                         // safe to assume that we are in a content stream, so abort
                                         // early. The only situation where this could reasonably
@@ -226,6 +264,8 @@ impl<'a> Iterator for UntypedIter<'a> {
                                             found = true;
                                             break;
                                         }
+
+                                        counter += 1;
                                     }
 
                                     if !found {
@@ -234,7 +274,7 @@ impl<'a> Iterator for UntypedIter<'a> {
                                         self.reader.read_bytes(2)?;
                                         continue 'outer;
                                     }
-                                } else if bytes == b"BI" {
+                                } else {
                                     // Possibly another inline image, if so, the previously found "EI"
                                     // is indeed the end of data.
                                     let mut cloned = find_reader.clone();
@@ -250,21 +290,20 @@ impl<'a> Iterator for UntypedIter<'a> {
                                 find_reader.read_byte()?;
                             }
 
-                            self.stack.push(Object::Stream(stream));
+                            self.stack.push(Object::Stream(stream))?;
 
                             self.reader.read_bytes(2)?;
                             self.reader.skip_white_spaces();
 
                             break;
-                        } else {
-                            self.reader.read_byte()?;
                         }
                     }
                 }
 
+                self.operator = Some(operator);
                 return Some(Instruction {
-                    operands: core::mem::take(&mut self.stack),
-                    operator,
+                    operands: &self.stack,
+                    operator: self.operator.as_ref().unwrap(),
                 });
             }
 
@@ -293,14 +332,13 @@ impl<'a> TypedIter<'a> {
     pub(crate) fn from_untyped(untyped: UntypedIter<'a>) -> Self {
         Self { untyped }
     }
-}
 
-impl<'a> Iterator for TypedIter<'a> {
-    type Item = TypedInstruction<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let op = &self.untyped.next()?;
-        match TypedInstruction::dispatch(op) {
+    /// Return the next typed instruction.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<TypedInstruction<'_, 'a>> {
+        let op = self.untyped.next()?;
+        // TODO: Explore whether dispatching can be made more efficient.
+        match TypedInstruction::dispatch(&op) {
             Some(op) => Some(op),
             // In case this returns `None`, the content stream is invalid. In case a path-drawing
             // operator was used, let's abort completely, otherwise we might end up drawing random stuff.
@@ -320,7 +358,7 @@ impl<'a> Iterator for TypedIter<'a> {
                 {
                     None
                 } else {
-                    Some(TypedInstruction::Fallback(op.operator.clone()))
+                    Some(TypedInstruction::Fallback(op.operator))
                 }
             }
         }
@@ -328,23 +366,27 @@ impl<'a> Iterator for TypedIter<'a> {
 }
 
 /// An instruction (= operator and its operands) in a content stream.
-pub struct Instruction<'a> {
+pub struct Instruction<'b, 'a> {
     /// The stack containing the operands.
-    pub operands: Stack<'a>,
+    pub operands: &'b Stack<'a>,
     /// The actual operator.
-    pub operator: Operator,
+    pub operator: &'b Operator<'a>,
 }
 
-impl<'a> Instruction<'a> {
+impl<'b, 'a> Instruction<'b, 'a> {
     /// An iterator over the operands of the instruction.
-    pub fn operands(self) -> OperandIterator<'a> {
+    pub fn operands(&self) -> OperandIterator<'b, 'a> {
         OperandIterator::new(self.operands)
     }
 }
 
 /// A stack holding the arguments of an operator.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Stack<'a>(SmallVec<[Object<'a>; OPERANDS_THRESHOLD]>);
+pub struct Stack<'a> {
+    // TODO: Explore using an object pool to avoid repeatedly
+    // allocating/deallocating objects.
+    data: [Object<'a>; OPERANDS_THRESHOLD],
+    len: usize,
+}
 
 impl<'a> Default for Stack<'a> {
     fn default() -> Self {
@@ -355,36 +397,49 @@ impl<'a> Default for Stack<'a> {
 impl<'a> Stack<'a> {
     /// Create a new, empty stack.
     pub fn new() -> Self {
-        Self(SmallVec::new())
+        Self {
+            data: array::from_fn(|_| Object::Null(Null)),
+            len: 0,
+        }
     }
 
-    fn push(&mut self, operand: Object<'a>) {
-        self.0.push(operand);
+    fn push(&mut self, operand: Object<'a>) -> Option<()> {
+        if self.len >= OPERANDS_THRESHOLD {
+            return None;
+        }
+
+        self.data[self.len] = operand;
+        self.len += 1;
+        Some(())
     }
 
     fn clear(&mut self) {
-        self.0.clear();
+        self.len = 0;
     }
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.len
     }
 
-    fn get<T>(&self, index: usize) -> Option<T>
+    fn as_slice(&self) -> &[Object<'a>] {
+        &self.data[..self.len]
+    }
+
+    fn get<'b, T>(&'b self, index: usize) -> Option<T>
     where
-        T: ObjectLike<'a>,
+        T: Operand<'b, 'a>,
     {
-        self.0.get(index).and_then(|e| e.clone().cast::<T>())
+        self.as_slice().get(index).and_then(T::from_object)
     }
 
-    fn get_all<T>(&self) -> Option<SmallVec<[T; OPERANDS_THRESHOLD]>>
+    fn get_all<'b, T>(&'b self) -> Option<SmallVec<[T; OPERANDS_THRESHOLD]>>
     where
-        T: ObjectLike<'a>,
+        T: Operand<'b, 'a>,
     {
         let mut operands = SmallVec::new();
 
-        for op in &self.0 {
-            let converted = op.clone().cast::<T>()?;
+        for op in self.as_slice() {
+            let converted = T::from_object(op)?;
             operands.push(converted);
         }
 
@@ -392,14 +447,91 @@ impl<'a> Stack<'a> {
     }
 }
 
+impl Debug for Stack<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+impl Clone for Stack<'_> {
+    fn clone(&self) -> Self {
+        let mut stack = Self::new();
+        for item in self.as_slice() {
+            stack.push(item.clone()).unwrap();
+        }
+        stack
+    }
+}
+
+impl PartialEq for Stack<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+trait Operand<'b, 'a>: Sized {
+    fn from_object(object: &'b Object<'a>) -> Option<Self>;
+}
+
+impl<'b, 'a> Operand<'b, 'a> for Number {
+    fn from_object(object: &'b Object<'a>) -> Option<Self> {
+        match object {
+            Object::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+impl<'b, 'a> Operand<'b, 'a> for &'b object::String<'a> {
+    fn from_object(object: &'b Object<'a>) -> Option<Self> {
+        match object {
+            Object::String(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl<'b, 'a> Operand<'b, 'a> for &'b Name<'a> {
+    fn from_object(object: &'b Object<'a>) -> Option<Self> {
+        match object {
+            Object::Name(n) => Some(n),
+            _ => None,
+        }
+    }
+}
+
+impl<'b, 'a> Operand<'b, 'a> for &'b Array<'a> {
+    fn from_object(object: &'b Object<'a>) -> Option<Self> {
+        match object {
+            Object::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+}
+
+impl<'b, 'a> Operand<'b, 'a> for &'b Stream<'a> {
+    fn from_object(object: &'b Object<'a>) -> Option<Self> {
+        match object {
+            Object::Stream(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl<'b, 'a> Operand<'b, 'a> for &'b Object<'a> {
+    fn from_object(object: &'b Object<'a>) -> Option<Self> {
+        Some(object)
+    }
+}
+
 /// An iterator over the operands of an operator.
-pub struct OperandIterator<'a> {
-    stack: Stack<'a>,
+pub struct OperandIterator<'b, 'a> {
+    stack: &'b Stack<'a>,
     cur_index: usize,
 }
 
-impl<'a> OperandIterator<'a> {
-    fn new(stack: Stack<'a>) -> Self {
+impl<'b, 'a> OperandIterator<'b, 'a> {
+    fn new(stack: &'b Stack<'a>) -> Self {
         Self {
             stack,
             cur_index: 0,
@@ -407,11 +539,11 @@ impl<'a> OperandIterator<'a> {
     }
 }
 
-impl<'a> Iterator for OperandIterator<'a> {
-    type Item = Object<'a>;
+impl<'b, 'a> Iterator for OperandIterator<'b, 'a> {
+    type Item = &'b Object<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(item) = self.stack.get::<Object<'a>>(self.cur_index) {
+        if let Some(item) = self.stack.as_slice().get(self.cur_index) {
             self.cur_index += 1;
 
             Some(item)
@@ -421,29 +553,64 @@ impl<'a> Iterator for OperandIterator<'a> {
     }
 }
 
-pub(crate) trait OperatorTrait<'a>
-where
-    Self: Sized + Into<TypedInstruction<'a>> + TryFrom<TypedInstruction<'a>>,
-{
+pub(crate) trait OperatorTrait<'b, 'a>: Sized {
     const OPERATOR: &'static str;
 
-    fn from_stack(stack: &Stack<'a>) -> Option<Self>;
+    fn from_stack(stack: &'b Stack<'a>) -> Option<Self>;
 }
 
 mod macros {
+    macro_rules! display_op {
+        ($t:ident $(<$($l:lifetime),+>)?;) => {
+            impl$(<$($l),+>)? core::fmt::Display for $t$(<$($l),+>)? {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(stringify!($t))
+                }
+            }
+        };
+        ($t:ident $(<$($l:lifetime),+>)?; $first:tt $(, $field:tt)*) => {
+            impl$(<$($l),+>)? core::fmt::Display for $t$(<$($l),+>)? {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(concat!(stringify!($t), "("))?;
+                    core::fmt::Display::fmt(&self.$first, f)?;
+                    $(
+                        f.write_str(" ")?;
+                        core::fmt::Display::fmt(&self.$field, f)?;
+                    )*
+                    f.write_str(")")
+                }
+            }
+        };
+    }
+
+    macro_rules! display_variadic_op {
+        ($t:ident $(<$($l:lifetime),+>)?) => {
+            impl$(<$($l),+>)? core::fmt::Display for $t$(<$($l),+>)? {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(stringify!($t))?;
+                    if let Some((first, rest)) = self.0.split_first() {
+                        f.write_str("(")?;
+                        core::fmt::Display::fmt(first, f)?;
+                        for value in rest {
+                            f.write_str(" ")?;
+                            core::fmt::Display::fmt(value, f)?;
+                        }
+                        f.write_str(")")?;
+                    }
+                    Ok(())
+                }
+            }
+        };
+    }
+
     macro_rules! op_impl {
-        ($t:ident $(<$l:lifetime>),*, $e:expr, $n:expr, $body:expr) => {
-            impl<'a> OperatorTrait<'a> for $t$(<$l>),* {
+        ($t:ident $(<$($l:lifetime),+>)?, $e:expr, $n:expr, |$stack:ident : $stack_ty:ty| $body:block) => {
+            impl<'b, 'a> OperatorTrait<'b, 'a> for $t$(<$($l),+>)? {
                 const OPERATOR: &'static str = $e;
 
-                fn from_stack(stack: &Stack<'a>) -> Option<Self> {
-                    if $n != u8::MAX as usize {
-                        if stack.len() != $n {
-                            warn!("wrong stack length {} for operator {}, expected {}", stack.len(), Self::OPERATOR, $n);
-                        }
-                    }
-
-                    $body(stack).or_else(|| {
+                #[inline(always)]
+                fn from_stack($stack: $stack_ty) -> Option<Self> {
+                    $body.or_else(|| {
                         warn!("failed to convert operands for operator {}", Self::OPERATOR);
 
                         None
@@ -451,16 +618,16 @@ mod macros {
                 }
             }
 
-            impl<'a> From<$t$(<$l>),*> for TypedInstruction<'a> {
-                fn from(value: $t$(<$l>),*) -> Self {
+            impl<'b, 'a> From<$t$(<$($l),+>)?> for TypedInstruction<'b, 'a> {
+                fn from(value: $t$(<$($l),+>)?) -> Self {
                     TypedInstruction::$t(value)
                 }
             }
 
-            impl<'a> TryFrom<TypedInstruction<'a>> for $t$(<$l>),* {
+            impl<'b, 'a> TryFrom<TypedInstruction<'b, 'a>> for $t$(<$($l),+>)? {
                 type Error = ();
 
-                fn try_from(value: TypedInstruction<'a>) -> core::result::Result<Self, Self::Error> {
+                fn try_from(value: TypedInstruction<'b, 'a>) -> core::result::Result<Self, Self::Error> {
                     match value {
                         TypedInstruction::$t(e) => Ok(e),
                         _ => Err(())
@@ -476,14 +643,18 @@ mod macros {
     // of the stack.
 
     macro_rules! op0 {
-        ($t:ident $(<$l:lifetime>),*, $e:expr) => {
-            crate::content::macros::op_impl!($t$(<$l>),*, $e, 0, |_| Some(Self));
+        ($t:ident $(<$($l:lifetime),+>)?, $e:expr) => {
+            crate::content::macros::display_op!($t$(<$($l),+>)?;);
+            crate::content::macros::op_impl!($t$(<$($l),+>)?, $e, 0, |_stack: &'b Stack<'a>| {
+                Some(Self)
+            });
         }
     }
 
     macro_rules! op1 {
-        ($t:ident $(<$l:lifetime>),*, $e:expr) => {
-            crate::content::macros::op_impl!($t$(<$l>),*, $e, 1, |stack: &Stack<'a>| {
+        ($t:ident $(<$($l:lifetime),+>)?, $e:expr) => {
+            crate::content::macros::display_op!($t$(<$($l),+>)?; 0);
+            crate::content::macros::op_impl!($t$(<$($l),+>)?, $e, 1, |stack: &'b Stack<'a>| {
                 let shift = stack.len().saturating_sub(1);
                 Some(Self(stack.get(0 + shift)?))
             });
@@ -491,15 +662,18 @@ mod macros {
     }
 
     macro_rules! op_all {
-        ($t:ident $(<$l:lifetime>),*, $e:expr) => {
-            crate::content::macros::op_impl!($t$(<$l>),*, $e, u8::MAX as usize, |stack: &Stack<'a>|
-            Some(Self(stack.get_all()?)));
+        ($t:ident $(<$($l:lifetime),+>)?, $e:expr) => {
+            crate::content::macros::display_variadic_op!($t$(<$($l),+>)?);
+            crate::content::macros::op_impl!($t$(<$($l),+>)?, $e, u8::MAX as usize, |stack: &'b Stack<'a>| {
+                Some(Self(stack.get_all()?))
+            });
         }
     }
 
     macro_rules! op2 {
-        ($t:ident $(<$l:lifetime>),*, $e:expr) => {
-            crate::content::macros::op_impl!($t$(<$l>),*, $e, 2, |stack: &Stack<'a>| {
+        ($t:ident $(<$($l:lifetime),+>)?, $e:expr) => {
+            crate::content::macros::display_op!($t$(<$($l),+>)?; 0, 1);
+            crate::content::macros::op_impl!($t$(<$($l),+>)?, $e, 2, |stack: &'b Stack<'a>| {
                 let shift = stack.len().saturating_sub(2);
                 Some(Self(stack.get(0 + shift)?, stack.get(1 + shift)?))
             });
@@ -507,8 +681,9 @@ mod macros {
     }
 
     macro_rules! op3 {
-        ($t:ident $(<$l:lifetime>),*, $e:expr) => {
-            crate::content::macros::op_impl!($t$(<$l>),*, $e, 3, |stack: &Stack<'a>| {
+        ($t:ident $(<$($l:lifetime),+>)?, $e:expr) => {
+            crate::content::macros::display_op!($t$(<$($l),+>)?; 0, 1, 2);
+            crate::content::macros::op_impl!($t$(<$($l),+>)?, $e, 3, |stack: &'b Stack<'a>| {
                 let shift = stack.len().saturating_sub(3);
                 Some(Self(stack.get(0 + shift)?, stack.get(1 + shift)?,
                 stack.get(2 + shift)?))
@@ -517,8 +692,9 @@ mod macros {
     }
 
     macro_rules! op4 {
-        ($t:ident $(<$l:lifetime>),*, $e:expr) => {
-            crate::content::macros::op_impl!($t$(<$l>),*, $e, 4, |stack: &Stack<'a>| {
+        ($t:ident $(<$($l:lifetime),+>)?, $e:expr) => {
+            crate::content::macros::display_op!($t$(<$($l),+>)?; 0, 1, 2, 3);
+            crate::content::macros::op_impl!($t$(<$($l),+>)?, $e, 4, |stack: &'b Stack<'a>| {
                let shift = stack.len().saturating_sub(4);
             Some(Self(stack.get(0 + shift)?, stack.get(1 + shift)?,
             stack.get(2 + shift)?, stack.get(3 + shift)?))
@@ -527,8 +703,9 @@ mod macros {
     }
 
     macro_rules! op6 {
-        ($t:ident $(<$l:lifetime>),*, $e:expr) => {
-            crate::content::macros::op_impl!($t$(<$l>),*, $e, 6, |stack: &Stack<'a>| {
+        ($t:ident $(<$($l:lifetime),+>)?, $e:expr) => {
+            crate::content::macros::display_op!($t$(<$($l),+>)?; 0, 1, 2, 3, 4, 5);
+            crate::content::macros::op_impl!($t$(<$($l),+>)?, $e, 6, |stack: &'b Stack<'a>| {
                 let shift = stack.len().saturating_sub(6);
             Some(Self(stack.get(0 + shift)?, stack.get(1 + shift)?,
             stack.get(2 + shift)?, stack.get(3 + shift)?,
@@ -537,6 +714,8 @@ mod macros {
         }
     }
 
+    pub(crate) use display_op;
+    pub(crate) use display_variadic_op;
     pub(crate) use op_all;
     pub(crate) use op_impl;
     pub(crate) use op0;

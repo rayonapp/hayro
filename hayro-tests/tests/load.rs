@@ -1,5 +1,6 @@
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::render_pdf;
+use hayro_jbig2::DecoderContext;
 use hayro_jpeg2000::{DecodeSettings, Image};
 use hayro_syntax::Pdf;
 use hayro_syntax::metadata::Metadata;
@@ -10,6 +11,20 @@ fn load_pdf(file: &[u8]) {
 
     if let Ok(pdf) = pdf {
         let _pixmaps = render_pdf(&pdf, 1.0, InterpreterSettings::default(), None);
+    }
+}
+
+fn load_jbig2(file: &[u8]) {
+    struct NullDecoder;
+    impl hayro_jbig2::Decoder for NullDecoder {
+        fn push_pixel(&mut self, _black: bool) {}
+        fn push_pixel_chunk(&mut self, _black: bool, _chunk_count: u32) {}
+        fn next_line(&mut self) {}
+    }
+
+    if let Ok(image) = hayro_jbig2::Image::new(file) {
+        let mut ctx = DecoderContext::default();
+        let _ = image.decode_with(&mut NullDecoder, &mut ctx);
     }
 }
 
@@ -390,6 +405,12 @@ fn page_tree_cycle() {
 }
 
 #[test]
+fn xobject_cycle_two_forms() {
+    let file = include_bytes!("../pdfs/load/xobject_cycle_two_forms.pdf");
+    load_pdf(file);
+}
+
+#[test]
 fn issue645() {
     let file = include_bytes!("../pdfs/load/issue645.pdf");
     load_pdf(file);
@@ -612,6 +633,12 @@ fn issue202() {
 }
 
 #[test]
+fn issue1051() {
+    let file = include_bytes!("../pdfs/load/issue1051.pdf");
+    load_pdf(file);
+}
+
+#[test]
 fn metadata_in_object_stream() {
     // Normally, in an encrypted PDF file strings need to be encrypted when they are not
     // in a stream. Therefore, we need to ensure that no encryption is applied when the object
@@ -649,4 +676,70 @@ fn metadata_in_object_stream() {
     };
 
     assert_eq!(pdf.metadata(), &expected);
+}
+
+#[test]
+fn generic_refinement_decoding_overflow() {
+    let file = include_bytes!("../pdfs/load/generic_refinement_decoding_overflow.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn invalid_strip_delta() {
+    let file = include_bytes!("../pdfs/load/invalid_strip_delta.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn conflicting_huffman_codes() {
+    let file = include_bytes!("../pdfs/load/conflicting_huffman_codes.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn custom_huffman_table_oob() {
+    let file = include_bytes!("../pdfs/load/custom_huffman_table_oob.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn integer_decode_overflow() {
+    let file = include_bytes!("../pdfs/load/integer_decode_overflow.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn too_many_symbol_instances() {
+    let file = include_bytes!("../pdfs/load/too_many_symbol_instances.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn refinement_tpgr_overflow() {
+    let file = include_bytes!("../pdfs/load/refinement_tpgr_overflow.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn zero_dimension_bitmap() {
+    let file = include_bytes!("../pdfs/load/zero_dimension_bitmap.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn huffman_code_overflow() {
+    let file = include_bytes!("../pdfs/load/huffman_code_overflow.jb2");
+    load_jbig2(file);
+}
+
+#[test]
+fn issue1321() {
+    let file = include_bytes!("../pdfs/load/issue1321.pdf");
+    load_pdf(file);
+}
+
+#[test]
+fn encrypted_oob_length() {
+    let file = include_bytes!("../pdfs/load/encrypted_oob_length.pdf");
+    load_pdf(file);
 }

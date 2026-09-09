@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "hayro-interpret",
     "hayro",
+    "hayro-bench",
     "hayro-syntax",
     "hayro-demo",
     "hayro-tests",
@@ -11,7 +12,6 @@ members = [
     "hayro-jpeg2000",
     "hayro-jbig2",
     "hayro-ccitt",
-    "hayro-font",
     "hayro-fuzz",
     "hayro-postscript",
     "hayro-cmap"
@@ -20,20 +20,20 @@ members = [
 [workspace.package]
 authors = ["Laurenz Stampfl <laurenz.stampfl@gmail.com>"]
 edition = "2024"
+rust-version = "1.92" # also change in ci.yml
 repository = "https://github.com/LaurenzV/hayro"
 readme = "README.md"
 license = "Apache-2.0 OR MIT"
 
 [workspace.dependencies]
-hayro = { path = "hayro", version = "0.5.0", default-features = false }
-hayro-ccitt = { path = "hayro-ccitt", version = "0.2.0", default-features = false }
-hayro-font = { path = "hayro-font", version = "0.4.0", default-features = false }
-hayro-interpret = { path = "hayro-interpret", version = "0.5.0", default-features = false }
-hayro-jpeg2000 = { path = "hayro-jpeg2000", version = "0.3.2", default-features = false }
-hayro-jbig2 = { path = "hayro-jbig2", version = "0.1.0", default-features = false }
-hayro-syntax = { path = "hayro-syntax", version = "0.5.0", default-features = false }
-hayro-svg = { path = "hayro-svg", version = "0.3.0", default-features = false }
-hayro-write = { path = "hayro-write", version = "0.4.0", default-features = false }
+hayro = { path = "hayro", version = "0.7.0", default-features = false }
+hayro-ccitt = { path = "hayro-ccitt", version = "0.3.0", default-features = false }
+hayro-interpret = { path = "hayro-interpret", version = "0.7.0", default-features = false }
+hayro-jpeg2000 = { path = "hayro-jpeg2000", version = "0.4.0", default-features = false }
+hayro-jbig2 = { path = "hayro-jbig2", version = "0.3.0", default-features = false }
+hayro-syntax = { path = "hayro-syntax", version = "0.7.2", default-features = false }
+hayro-svg = { path = "hayro-svg", version = "0.7.0", default-features = false }
+hayro-write = { path = "hayro-write", version = "0.7.0", default-features = false }
 hayro-postscript = { path = "hayro-postscript", version = "0.1.0", default-features = false }
 hayro-cmap = { path = "hayro-cmap", version = "0.1.0", default-features = false }
 
@@ -42,25 +42,24 @@ bytemuck = { version = "1" }
 image = { version = "0.25", default-features = false }
 kurbo = { version = "0.13.0" }
 log = { version = "0.4" }
-resvg = { version = "0.46.0" }
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-once_cell = { version = "1" }
+resvg = { version = "0.47.0" }
+flate2 = { version = "1" }
 phf = { version = "0.13.1", default-features = false }
-moxcms = { version = "0.7.11" }
+moxcms = { version = "0.8.1" }
 rustc-hash = { version = "2" }
 siphasher = "1"
-skrifa = { version = "0.40.0" }
+skrifa = { version = "0.46.0" }
 smallvec = { version = "1" }
 yoke = { version = "0.8" }
-pdf-writer = "0.14.0"
-sitro = { git = "https://github.com/LaurenzV/sitro", rev="fb804b3" }
+pdf-writer = { git = "https://github.com/typst/pdf-writer", rev = "fdf090125f1e7209fa630c4ca1f5f29910c87c93" }
 xmlwriter = { version = "0.1" }
 base64 = { version = "0.22" }
 zune-jpeg = { version = "0.5", default-features = false }
-vello_cpu = { version = "0.0.6", default-features = false, features = ["std", "png", "u8_pipeline"] }
-fast_image_resize = { version = "6.0", default-features = false, features = ["std"] }
-fearless_simd = "0.3.0"
+vello_cpu = { git = "https://github.com/linebender/vello", rev = "dc23e93841d20060743e490ef49c1e0d0d22cf40", default-features = false, features = ["std", "png", "u8_pipeline"] }
+pic-scale = { version = "0.7.9", default-features = false }
+fearless_simd = "0.6.0"
 brotli = { version = "8", default-features = false, features = ["std"] }
+memchr = { version = "2.8.0", default-features = false, features = ["alloc"] }
 
 [workspace.lints]
 # This one may vary depending on the project.

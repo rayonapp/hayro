@@ -11,6 +11,7 @@ mod jbig2;
 #[cfg(feature = "images")]
 mod jpx;
 mod lzw_flate;
+mod png;
 mod run_length;
 
 use crate::object::Dict;
@@ -18,7 +19,6 @@ use crate::object::Name;
 use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams};
 use core::ops::Deref;
-use log::warn;
 
 /// A data filter.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -61,7 +61,7 @@ impl Filter {
         }
     }
 
-    pub(crate) fn from_name(name: Name) -> Option<Self> {
+    pub(crate) fn from_name(name: Name<'_>) -> Option<Self> {
         match name.deref() {
             ASCII_HEX_DECODE | ASCII_HEX_DECODE_ABBREVIATION => Some(Self::AsciiHexDecode),
             ASCII85_DECODE | ASCII85_DECODE_ABBREVIATION => Some(Self::Ascii85Decode),
@@ -84,9 +84,9 @@ impl Filter {
     pub(crate) fn apply(
         &self,
         data: &[u8],
-        params: Dict<'_>,
+        params: &Dict<'_>,
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
-    ) -> Result<FilterResult, DecodeFailure> {
+    ) -> Result<FilterResult<'static>, DecodeFailure> {
         let res = match self {
             Self::AsciiHexDecode => ascii_hex::decode(data)
                 .map(FilterResult::from_data)
@@ -112,9 +112,9 @@ impl Filter {
                 ccitt::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
             }
             #[cfg(feature = "images")]
-            Self::Jbig2Decode => Ok(FilterResult::from_data(
-                jbig2::decode(data, params).ok_or(DecodeFailure::ImageDecode)?,
-            )),
+            Self::Jbig2Decode => {
+                jbig2::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
+            }
             #[cfg(feature = "images")]
             Self::JpxDecode => jpx::decode(data, image_params).ok_or(DecodeFailure::ImageDecode),
             #[cfg(not(feature = "images"))]

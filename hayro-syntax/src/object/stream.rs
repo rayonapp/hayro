@@ -7,32 +7,31 @@ use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, LENGTH, TYPE};
 use crate::object::{Array, ObjectIdentifier};
-use crate::object::{Object, ObjectLike};
+use crate::object::{Object, ObjectLike, ObjectRefLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
-use crate::sync::Arc;
-use crate::util::OptionLog;
+use crate::trivia::is_white_space_character;
+use crate::util::{OptionLog, find_needle};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
-use core::fmt::{Debug, Formatter};
-use log::warn;
+use core::fmt::{Debug, Display, Formatter};
 use smallvec::SmallVec;
 
-#[derive(Clone)]
-struct StreamInner<'a> {
-    dict: Dict<'a>,
+struct FiltersAndParams<'a> {
     filters: SmallVec<[Filter; 2]>,
-    filter_params: SmallVec<[Dict<'a>; 2]>,
-    data: &'a [u8],
+    params: SmallVec<[Dict<'a>; 2]>,
 }
 
 /// A stream of arbitrary data.
 #[derive(Clone)]
-pub struct Stream<'a>(Arc<StreamInner<'a>>);
+pub struct Stream<'a> {
+    dict: Dict<'a>,
+    data: &'a [u8],
+}
 
 impl PartialEq for Stream<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.dict == other.0.dict && self.0.data == other.0.data
+        self.dict == other.dict && self.data == other.data
     }
 }
 
@@ -57,29 +56,37 @@ pub struct ImageDecodeParams {
 
 impl<'a> Stream<'a> {
     pub(crate) fn new(data: &'a [u8], dict: Dict<'a>) -> Self {
+        Self { dict, data }
+    }
+
+    fn filters_and_params(&self) -> FiltersAndParams<'a> {
         let mut collected_filters = SmallVec::new();
         let mut collected_params = SmallVec::new();
 
-        if let Some(filter) = dict
-            .get::<Name>(F)
-            .or_else(|| dict.get::<Name>(FILTER))
+        if let Some(filter) = self
+            .dict
+            .get::<Name<'_>>(F)
+            .or_else(|| self.dict.get::<Name<'_>>(FILTER))
             .and_then(Filter::from_name)
         {
-            let params = dict
+            let params = self
+                .dict
                 .get::<Dict<'_>>(DP)
-                .or_else(|| dict.get::<Dict<'_>>(DECODE_PARMS))
+                .or_else(|| self.dict.get::<Dict<'_>>(DECODE_PARMS))
                 .unwrap_or_default();
 
             collected_filters.push(filter);
             collected_params.push(params);
-        } else if let Some(filters) = dict
+        } else if let Some(filters) = self
+            .dict
             .get::<Array<'_>>(F)
-            .or_else(|| dict.get::<Array<'_>>(FILTER))
+            .or_else(|| self.dict.get::<Array<'_>>(FILTER))
         {
-            let filters = filters.iter::<Name>().map(Filter::from_name);
-            let mut params = dict
+            let filters = filters.iter::<Name<'_>>().map(Filter::from_name);
+            let mut params = self
+                .dict
                 .get::<Array<'_>>(DP)
-                .or_else(|| dict.get::<Array<'_>>(DECODE_PARMS))
+                .or_else(|| self.dict.get::<Array<'_>>(DECODE_PARMS))
                 .map(|a| a.iter::<Object<'_>>());
 
             for filter in filters {
@@ -96,63 +103,60 @@ impl<'a> Stream<'a> {
             }
         }
 
-        Self(Arc::new(StreamInner {
-            dict,
+        FiltersAndParams {
             filters: collected_filters,
-            filter_params: collected_params,
-            data,
-        }))
+            params: collected_params,
+        }
     }
 
     /// Return the raw, decrypted data of the stream.
     ///
     /// Stream filters will not be applied.
     pub fn raw_data(&self) -> Cow<'a, [u8]> {
-        let ctx = self.0.dict.ctx();
+        let ctx = self.dict.ctx();
 
         if ctx.xref().needs_decryption(ctx)
             && self
-                .0
                 .dict
-                .get::<object::String>(TYPE)
+                .get::<object::String<'_>>(TYPE)
                 .map(|t| t.as_ref() != b"XRef")
                 .unwrap_or(true)
         {
             Cow::Owned(
                 ctx.xref()
-                    .decrypt(
-                        self.0.dict.obj_id().unwrap(),
-                        self.0.data,
-                        DecryptionTarget::Stream,
-                    )
+                    .decrypt(self.obj_id(), self.data, DecryptionTarget::Stream)
                     // TODO: MAybe an error would be better?
                     .unwrap_or_default(),
             )
         } else {
-            Cow::Borrowed(self.0.data)
+            Cow::Borrowed(self.data)
         }
     }
 
     /// Return the raw, underlying dictionary of the stream.
     pub fn dict(&self) -> &Dict<'a> {
-        &self.0.dict
+        &self.dict
     }
 
     /// Return the object identifier of the stream.
     pub fn obj_id(&self) -> ObjectIdentifier {
-        self.0.dict.obj_id().unwrap()
+        self.dict.obj_id().unwrap_or_else(|| {
+            // In theory shouldn't ever happen, but could theoretically be
+            // triggered in a crafted PDF.
+            ObjectIdentifier::new(0, 0)
+        })
     }
 
     /// Return the filters that are applied to the stream.
-    pub fn filters(&self) -> &[Filter] {
-        &self.0.filters
+    pub fn filters(&self) -> SmallVec<[Filter; 2]> {
+        self.filters_and_params().filters
     }
 
     /// Return the decoded data of the stream.
     ///
     /// Note that the result of this method will not be cached, so calling it multiple
     /// times is expensive.
-    pub fn decoded(&self) -> Result<Vec<u8>, DecodeFailure> {
+    pub fn decoded(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
         self.decoded_image(&ImageDecodeParams::default())
             .map(|r| r.data)
     }
@@ -162,22 +166,27 @@ impl<'a> Stream<'a> {
     pub fn decoded_image(
         &self,
         image_params: &ImageDecodeParams,
-    ) -> Result<FilterResult, DecodeFailure> {
+    ) -> Result<FilterResult<'a>, DecodeFailure> {
         let data = self.raw_data();
+        let filters_and_params = self.filters_and_params();
 
-        let mut current: Option<FilterResult> = None;
+        let mut current: Option<FilterResult<'a>> = None;
 
-        for (filter, params) in self.0.filters.iter().zip(self.0.filter_params.iter()) {
+        for (filter, params) in filters_and_params
+            .filters
+            .iter()
+            .zip(filters_and_params.params.iter())
+        {
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
-                params.clone(),
+                params,
                 image_params,
             )?;
             current = Some(new);
         }
 
         Ok(current.unwrap_or(FilterResult {
-            data: data.to_vec(),
+            data,
             image_data: None,
         }))
     }
@@ -185,7 +194,13 @@ impl<'a> Stream<'a> {
 
 impl Debug for Stream<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Stream (len: {:?})", self.0.data.len())
+        write!(f, "Stream (len: {:?})", self.data.len())
+    }
+}
+
+impl Display for Stream<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Stream (len: {})", self.data.len())
     }
 }
 
@@ -261,17 +276,17 @@ pub struct ImageData {
 }
 
 /// The result of applying a filter.
-pub struct FilterResult {
+pub struct FilterResult<'a> {
     /// The decoded data.
-    pub data: Vec<u8>,
+    pub data: Cow<'a, [u8]>,
     /// Additional data that is extracted from JPX image streams.
     pub image_data: Option<ImageData>,
 }
 
-impl FilterResult {
+impl FilterResult<'_> {
     pub(crate) fn from_data(data: Vec<u8>) -> Self {
         Self {
-            data,
+            data: Cow::Owned(data),
             image_data: None,
         }
     }
@@ -293,39 +308,39 @@ fn parse_proper<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
 }
 
 fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
-    while r.forward_tag(b"stream").is_none() {
-        r.read_byte()?;
-    }
+    let stream_offset = find_needle(r.tail()?, b"stream")?;
+    r.read_bytes(stream_offset)?;
+    r.forward_tag(b"stream")?;
 
     r.forward_tag(b"\n")
         .or_else(|| r.forward_tag(b"\r\n"))
         // Technically not allowed, but no reason to not try it.
         .or_else(|| r.forward_tag(b"\r"))?;
 
-    let data_start = r.tail()?;
-    let start = r.offset();
+    let tail = r.tail()?;
+    let endstream_offset = find_needle(tail, b"endstream")?;
+    let data_end = trim_trailing_ascii_whitespace(&tail[..endstream_offset]);
+    let data = tail.get(..data_end)?;
 
-    loop {
-        if r.peek_byte()?.is_ascii_whitespace() || r.peek_tag(b"endstream").is_some() {
-            let length = r.offset() - start;
-            let data = data_start.get(..length)?;
+    r.read_bytes(endstream_offset)?;
+    r.skip_white_spaces();
+    r.forward_tag(b"endstream")?;
 
-            r.skip_white_spaces();
+    Some(Stream::new(data, dict.clone()))
+}
 
-            // This was just a whitespace in the data stream but not actually marking the end
-            // of the stream, so continue searching.
-            if r.forward_tag(b"endstream").is_none() {
-                continue;
-            }
+fn trim_trailing_ascii_whitespace(data: &[u8]) -> usize {
+    let mut end = data.len();
 
-            let stream = Stream::new(data, dict.clone());
-
-            // Seems like we found the end!
-            return Some(stream);
-        } else {
-            r.read_byte()?;
-        }
+    while data
+        .get(end.wrapping_sub(1))
+        .copied()
+        .is_some_and(is_white_space_character)
+    {
+        end -= 1;
     }
+
+    end
 }
 
 impl<'a> TryFrom<Object<'a>> for Stream<'a> {
@@ -340,12 +355,30 @@ impl<'a> TryFrom<Object<'a>> for Stream<'a> {
 }
 
 impl<'a> ObjectLike<'a> for Stream<'a> {}
+impl<'a> ObjectRefLike<'a> for Stream<'a> {
+    fn cast_ref<'b>(obj: &'b Object<'a>) -> Option<&'b Self> {
+        match obj {
+            Object::Stream(stream) => Some(stream),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use crate::object::Stream;
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
+
+    #[test]
+    fn display() {
+        let mut reader = Reader::new(b"<< /Length 3 >> stream\nabc\nendstream");
+        let stream = reader
+            .read_with_context::<Stream<'_>>(&ReaderContext::dummy())
+            .unwrap();
+
+        assert_eq!(format!("{stream}"), "Stream (len: 3)");
+    }
 
     #[test]
     fn stream() {
@@ -355,6 +388,17 @@ mod tests {
             .read_with_context::<Stream<'_>>(&ReaderContext::dummy())
             .unwrap();
 
-        assert_eq!(stream.0.data, b"abcdefghij");
+        assert_eq!(stream.data, b"abcdefghij");
+    }
+
+    #[test]
+    fn stream_fallback() {
+        let data = b"<< /Length 999 >> stream\nabcdefghij\nendstream";
+        let mut r = Reader::new(data);
+        let stream = r
+            .read_with_context::<Stream<'_>>(&ReaderContext::dummy())
+            .unwrap();
+
+        assert_eq!(stream.data, b"abcdefghij");
     }
 }

@@ -12,6 +12,10 @@
     "file": "pdfs/custom/TextClippingModeChanges.pdf"
   },
   {
+    "id": "annotation_checkbox",
+    "file": "pdfs/custom/annotation_checkbox.pdf"
+  },
+  {
     "id": "clip_path_evenodd",
     "file": "pdfs/custom/clip_path_evenodd.pdf"
   },
@@ -50,6 +54,10 @@
   {
     "id": "color_space_separation_2",
     "file": "pdfs/custom/color_space_separation_2.pdf"
+  },
+  {
+    "id": "filter_flate_1bit",
+    "file": "pdfs/custom/filter_flate_1bit.pdf"
   },
   {
     "id": "filter_tiff_predictor_gray",
@@ -244,6 +252,10 @@
     "file": "pdfs/custom/image_ccit_4.pdf"
   },
   {
+    "id": "image_ccitt_rows_below_height",
+    "file": "pdfs/custom/image_ccitt_rows_below_height.pdf"
+  },
+  {
     "id": "image_cmyk_icc_jpg",
     "file": "pdfs/custom/image_cmyk_icc_jpg.pdf"
   },
@@ -326,6 +338,10 @@
   {
     "id": "image_mask_missing_bpc",
     "file": "pdfs/custom/image_mask_missing_bpc.pdf"
+  },
+  {
+    "id": "image_named_colorspace",
+    "file": "pdfs/custom/image_named_colorspace.pdf"
   },
   {
     "id": "image_rgb16",
@@ -440,6 +456,10 @@
   {
     "id": "page_rotation_none",
     "file": "pdfs/custom/page_rotation_none.pdf"
+  },
+  {
+    "id": "path_as_rect",
+    "file": "pdfs/custom/path_as_rect.pdf"
   },
   {
     "id": "path_rendering_1",
@@ -667,6 +687,11 @@
   {
     "id": "stream_jpx_6",
     "file": "pdfs/custom/stream_jpx_6.pdf"
+  },
+  {
+    "id": "stroke_hairline_large_ctm",
+    "file": "pdfs/custom/stroke_hairline_large_ctm.pdf",
+    "comment": "lines in the tiling patterns are not rendered correctly yet"
   },
   {
     "id": "text_filled_complex_paint",
@@ -1189,5 +1214,15 @@
   {
     "id": "issue1023",
     "file": "pdfs/custom/issue1023.pdf"
+  },
+  {
+    "id": "issue1276",
+    "link": true
+  },
+  {
+    "id": "issue1334",
+    "link": true,
+    "first_page": 12,
+    "last_page": 12
   }
 ]

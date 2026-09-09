@@ -12,15 +12,14 @@ use crate::interpret::text::TextRenderingMode;
 use crate::pattern::{Pattern, ShadingPattern};
 use crate::shading::Shading;
 use crate::util::{OptionLog, RectExt};
-use crate::x_object::{
-    FormXObject, ImageXObject, XObject, draw_form_xobject, draw_image_xobject, draw_xobject,
-};
+use crate::x_object::{FormXObject, ImageXObject, XObject};
+use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::dict::keys::{ANNOTS, AP, F, MCID, N, OC, RECT};
-use hayro_syntax::object::{Array, Dict, Object, Rect, Stream, dict_or_stream};
+use hayro_syntax::object::dict::keys::{ANNOTS, AP, AS, F, MCID, N, OC, RECT};
+use hayro_syntax::object::{Array, Dict, Name, Object, Rect, Stream, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
-use log::warn;
+use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 
@@ -154,11 +153,7 @@ pub fn interpret_page<'a>(
                 continue;
             }
 
-            if let Some(apx) = annot
-                .get::<Dict<'_>>(AP)
-                .and_then(|ap| ap.get::<Stream<'_>>(N))
-                .and_then(|o| FormXObject::new(&o))
-            {
+            if let Some(apx) = appearance_stream(&annot).and_then(|o| FormXObject::new(&o)) {
                 let Some(rect) = annot.get::<Rect>(RECT) else {
                     continue;
                 };
@@ -207,7 +202,7 @@ pub fn interpret_page<'a>(
                 context.pre_concat_affine(affine);
                 context.push_root_transform();
 
-                draw_form_xobject(resources, &apx, context, device);
+                apx.draw(resources, context, device);
                 context.pop_root_transform();
                 context.restore_state(device);
             }
@@ -215,33 +210,49 @@ pub fn interpret_page<'a>(
     }
 }
 
+fn appearance_stream<'a>(annot: &Dict<'a>) -> Option<Stream<'a>> {
+    match annot.get::<Dict<'_>>(AP)?.get::<Object<'_>>(N)? {
+        Object::Stream(stream) => Some(stream),
+        Object::Dict(states) => annot
+            .get::<Name<'_>>(AS)
+            .and_then(|state| states.get::<Stream<'_>>(state))
+            .or_else(|| states.get::<Stream<'_>>(b"Off")),
+        _ => None,
+    }
+}
+
 /// Interpret the instructions from `ops` and render them into the device.
-pub fn interpret<'a, 'b>(
-    ops: impl Iterator<Item = TypedInstruction<'b>>,
+pub fn interpret<'a>(
+    mut ops: TypedIter<'_>,
     resources: &Resources<'a>,
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
     let num_states = context.num_states();
+    let content_depth = context.ocg_state.depth();
+    let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
 
     context.save_state();
 
-    for op in ops {
+    while let Some(op) = ops.next() {
         match op {
             TypedInstruction::SaveState(_) => context.save_state(),
             TypedInstruction::StrokeColorDeviceRgb(s) => {
                 context.get_mut().graphics_state.stroke_cs = ColorSpace::device_rgb();
                 context.get_mut().graphics_state.stroke_color =
                     smallvec![s.0.as_f32(), s.1.as_f32(), s.2.as_f32()];
+                context.get_mut().graphics_state.stroke_pattern = None;
             }
             TypedInstruction::StrokeColorDeviceGray(s) => {
                 context.get_mut().graphics_state.stroke_cs = ColorSpace::device_gray();
                 context.get_mut().graphics_state.stroke_color = smallvec![s.0.as_f32()];
+                context.get_mut().graphics_state.stroke_pattern = None;
             }
             TypedInstruction::StrokeColorCmyk(s) => {
                 context.get_mut().graphics_state.stroke_cs = ColorSpace::device_cmyk();
                 context.get_mut().graphics_state.stroke_color =
                     smallvec![s.0.as_f32(), s.1.as_f32(), s.2.as_f32(), s.3.as_f32()];
+                context.get_mut().graphics_state.stroke_pattern = None;
             }
             TypedInstruction::LineWidth(w) => {
                 context.get_mut().graphics_state.stroke_props.line_width = w.0.as_f32();
@@ -304,16 +315,19 @@ pub fn interpret<'a, 'b>(
             TypedInstruction::NonStrokeColorDeviceGray(s) => {
                 context.get_mut().graphics_state.none_stroke_cs = ColorSpace::device_gray();
                 context.get_mut().graphics_state.non_stroke_color = smallvec![s.0.as_f32()];
+                context.get_mut().graphics_state.non_stroke_pattern = None;
             }
             TypedInstruction::NonStrokeColorDeviceRgb(s) => {
                 context.get_mut().graphics_state.none_stroke_cs = ColorSpace::device_rgb();
                 context.get_mut().graphics_state.non_stroke_color =
                     smallvec![s.0.as_f32(), s.1.as_f32(), s.2.as_f32()];
+                context.get_mut().graphics_state.non_stroke_pattern = None;
             }
             TypedInstruction::NonStrokeColorCmyk(s) => {
                 context.get_mut().graphics_state.none_stroke_cs = ColorSpace::device_cmyk();
                 context.get_mut().graphics_state.non_stroke_color =
                     smallvec![s.0.as_f32(), s.1.as_f32(), s.2.as_f32(), s.3.as_f32()];
+                context.get_mut().graphics_state.non_stroke_pattern = None;
             }
             TypedInstruction::LineTo(m) => {
                 if !context.path().elements().is_empty() {
@@ -365,7 +379,7 @@ pub fn interpret<'a, 'b>(
             }
             TypedInstruction::SetGraphicsState(gs) => {
                 if let Some(gs) = resources
-                    .get_ext_g_state(gs.0.clone())
+                    .get_ext_g_state(gs.0)
                     .warn_none(&format!("failed to get extgstate {}", gs.0.as_str()))
                 {
                     handle_gs(&gs, context, resources);
@@ -387,20 +401,14 @@ pub fn interpret<'a, 'b>(
                 context.path_mut().truncate(0);
             }
             TypedInstruction::NonStrokeColor(c) => {
-                let fill_c = &mut context.get_mut().graphics_state.non_stroke_color;
-                fill_c.truncate(0);
-
-                for e in c.0 {
-                    fill_c.push(e.as_f32());
-                }
+                let gs = &mut context.get_mut().graphics_state;
+                gs.non_stroke_color = c.0.into_iter().map(|n| n.as_f32()).collect();
+                gs.non_stroke_pattern = None;
             }
             TypedInstruction::StrokeColor(c) => {
-                let stroke_c = &mut context.get_mut().graphics_state.stroke_color;
-                stroke_c.truncate(0);
-
-                for e in c.0 {
-                    stroke_c.push(e.as_f32());
-                }
+                let gs = &mut context.get_mut().graphics_state;
+                gs.stroke_color = c.0.into_iter().map(|n| n.as_f32()).collect();
+                gs.stroke_pattern = None;
             }
             TypedInstruction::ClipNonZero(_) => {
                 *(context.clip_mut()) = Some(FillRule::NonZero);
@@ -413,7 +421,7 @@ pub fn interpret<'a, 'b>(
                 // Ignore for now.
             }
             TypedInstruction::ColorSpaceStroke(c) => {
-                let cs = if let Some(named) = ColorSpace::new_from_name(c.0.clone()) {
+                let cs = if let Some(named) = ColorSpace::new_from_name(c.0) {
                     named
                 } else {
                     context
@@ -421,11 +429,14 @@ pub fn interpret<'a, 'b>(
                         .unwrap_or(ColorSpace::device_gray())
                 };
 
+                if !cs.is_pattern() {
+                    context.get_mut().graphics_state.stroke_pattern = None;
+                }
                 context.get_mut().graphics_state.stroke_color = cs.initial_color();
                 context.get_mut().graphics_state.stroke_cs = cs;
             }
             TypedInstruction::ColorSpaceNonStroke(c) => {
-                let cs = if let Some(named) = ColorSpace::new_from_name(c.0.clone()) {
+                let cs = if let Some(named) = ColorSpace::new_from_name(c.0) {
                     named
                 } else {
                     context
@@ -433,6 +444,9 @@ pub fn interpret<'a, 'b>(
                         .unwrap_or(ColorSpace::device_gray())
                 };
 
+                if !cs.is_pattern() {
+                    context.get_mut().graphics_state.non_stroke_pattern = None;
+                }
                 context.get_mut().graphics_state.non_stroke_color = cs.initial_color();
                 context.get_mut().graphics_state.none_stroke_cs = cs;
             }
@@ -470,44 +484,51 @@ pub fn interpret<'a, 'b>(
                 // 1. A Name that references an entry in the Resources/Properties dictionary
                 // 2. An inline dictionary with an OC key
 
-                let mcid = dict_or_stream(&bdc.1).and_then(|(props, _)| props.get::<i32>(MCID));
+                let mcid = dict_or_stream(bdc.1).and_then(|(props, _)| props.get::<i32>(MCID));
 
-                let oc = bdc
-                    .1
-                    .clone()
-                    .into_name()
-                    .and_then(|name| {
-                        let r = resources.properties.get_ref(name.clone())?;
-                        let d = resources
-                            .properties
-                            .get::<Dict<'_>>(name)
-                            .unwrap_or_default();
-                        Some((d, r))
-                    })
-                    .or_else(|| {
-                        let (props, _) = dict_or_stream(&bdc.1)?;
-                        let r = props.get_ref(OC)?;
-                        let d = props.get::<Dict<'_>>(OC).unwrap_or_default();
-                        Some((d, r))
-                    });
-
-                if let Some((dict, oc_ref)) = oc {
-                    context.ocg_state.begin_ocg(&dict, oc_ref.into());
+                let oc = if bdc.0.as_ref() == OC {
+                    bdc.1
+                        .clone()
+                        .into_name()
+                        .and_then(|name| {
+                            let mut resources = resources;
+                            loop {
+                                if let Some(dict) = resources.properties.get::<Dict<'_>>(&name) {
+                                    let id = resources.properties.get_ref(&name).map(Into::into);
+                                    return Some((dict, id));
+                                }
+                                resources = resources.parent()?;
+                            }
+                        })
+                        .or_else(|| {
+                            let (props, _) = dict_or_stream(bdc.1)?;
+                            let r = props.get_ref(OC)?;
+                            let dict = context.xref.get::<Dict<'_>>(r.into())?;
+                            Some((dict, Some(r.into())))
+                        })
                 } else {
+                    None
+                };
+
+                device.begin_marked_content(bdc.0, mcid);
+
+                if !oc.is_some_and(|(dict, id)| {
+                    context.ocg_state.begin_optional_content(&dict, id, device)
+                }) {
                     context.ocg_state.begin_marked_content();
                 }
-
-                device.begin_marked_content(&bdc.0, mcid);
             }
             TypedInstruction::MarkedContentPointWithProperties(_) => {}
             TypedInstruction::EndMarkedContent(_) => {
-                context.ocg_state.end_marked_content();
-                device.end_marked_content();
+                if context.ocg_state.depth() > content_depth {
+                    context.ocg_state.end_marked_content(device);
+                    device.end_marked_content();
+                }
             }
             TypedInstruction::MarkedContentPoint(_) => {}
             TypedInstruction::BeginMarkedContent(bmc) => {
                 context.ocg_state.begin_marked_content();
-                device.begin_marked_content(&bmc.0, None);
+                device.begin_marked_content(bmc.0, None);
             }
             TypedInstruction::BeginText(_) => {
                 context.get_mut().text_state.text_matrix = Affine::IDENTITY;
@@ -551,7 +572,10 @@ pub fn interpret<'a, 'b>(
                 // 2) In case it's `None` because we were unable to resolve the font
                 // (for whatever reason), leave it as `None`. Better showing no
                 // text at all than garbage text.
-                let font = if let Some(font_dict) = resources.get_font(name.clone()) {
+                let font = if let Some(font_dict) = font_dict_cache.get(name).cloned() {
+                    context.resolve_font(&font_dict)
+                } else if let Some(font_dict) = resources.get_font(name) {
+                    font_dict_cache.insert(name.clone(), font_dict.clone());
                     context.resolve_font(&font_dict)
                 } else {
                     Font::new_standard(StandardFont::Helvetica, &context.settings.font_resolver)
@@ -585,13 +609,19 @@ pub fn interpret<'a, 'b>(
                     .map(TextStateFont::Fallback);
                 }
 
+                text::begin_glyph_run(context);
                 for obj in s.0.iter::<Object<'_>>() {
-                    if let Some(adjustment) = obj.clone().into_f32() {
-                        context.get_mut().text_state.apply_adjustment(adjustment);
-                    } else if let Some(text) = obj.into_string() {
-                        text::show_text_string(context, device, resources, text);
+                    match obj {
+                        Object::Number(num) => {
+                            text::apply_glyph_run_adjustment(context, num.as_f32());
+                        }
+                        Object::String(text) => {
+                            text::append_text_string(context, resources, &text);
+                        }
+                        _ => {}
                     }
                 }
+                text::show_glyph_run(context, device);
             }
             TypedInstruction::HorizontalScaling(h) => {
                 context.get_mut().text_state.horizontal_scaling = h.0.as_f32();
@@ -642,39 +672,40 @@ pub fn interpret<'a, 'b>(
             }
             TypedInstruction::ShapeGlyph(_) => {}
             TypedInstruction::XObject(x) => {
-                let cache = context.object_cache.clone();
+                let cache = context.interpreter_cache.object_cache.clone();
+                let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.get().graphics_state.transfer_function.clone();
                 if let Some(x_object) = resources.get_x_object(x.0).and_then(|s| {
                     XObject::new(
                         &s,
-                        &context.settings.warning_sink,
+                        |name| context.get_color_space(resources, name),
+                        &warning_sink,
                         &cache,
                         transfer_function.clone(),
                     )
                 }) {
-                    draw_xobject(&x_object, resources, context, device);
+                    x_object.draw(resources, context, device);
                 }
             }
             TypedInstruction::InlineImage(i) => {
                 let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.get().graphics_state.transfer_function.clone();
-                let cache = context.object_cache.clone();
+                let cache = context.interpreter_cache.object_cache.clone();
                 if let Some(x_object) = ImageXObject::new(
-                    &i.0,
-                    |name| context.get_color_space(resources, name.clone()),
+                    i.0,
+                    |name| context.get_color_space(resources, name),
                     &warning_sink,
                     &cache,
-                    false,
                     transfer_function,
                 ) {
-                    draw_image_xobject(&x_object, context, device);
+                    x_object.draw(context, device);
                 }
             }
             TypedInstruction::TextRise(t) => {
                 context.get_mut().text_state.rise = t.0.as_f32();
             }
             TypedInstruction::Shading(s) => {
-                if !context.ocg_state.is_visible() {
+                if !context.ocg_state.should_process() {
                     continue;
                 }
 
@@ -682,8 +713,10 @@ pub fn interpret<'a, 'b>(
 
                 if let Some(sp) = resources
                     .get_shading(s.0)
-                    .and_then(|o| dict_or_stream(&o))
-                    .and_then(|s| Shading::new(&s.0, s.1.as_ref(), &context.object_cache))
+                    .and_then(|o| {
+                        let (dict, stream) = dict_or_stream(&o)?;
+                        Shading::new(dict, stream, &context.interpreter_cache.object_cache)
+                    })
                     .map(|s| {
                         Pattern::Shading(ShadingPattern {
                             shading: Arc::new(s),
@@ -698,9 +731,6 @@ pub fn interpret<'a, 'b>(
                     let st = context.get_mut();
                     st.graphics_state.non_stroke_pattern = Some(sp);
                     st.graphics_state.none_stroke_cs = ColorSpace::pattern();
-
-                    device.set_soft_mask(st.graphics_state.soft_mask.clone());
-                    device.set_blend_mode(st.graphics_state.blend_mode);
 
                     let bbox = context.bbox().to_path(0.1);
                     let inverted_bbox = context.get().ctm.inverse() * bbox;
@@ -725,6 +755,12 @@ pub fn interpret<'a, 'b>(
                 warn!("failed to read an operator");
             }
         }
+    }
+
+    // Close unfinished marked content without disturbing scopes in the calling stream.
+    while context.ocg_state.depth() > content_depth {
+        context.ocg_state.end_marked_content(device);
+        device.end_marked_content();
     }
 
     while context.num_states() > num_states {

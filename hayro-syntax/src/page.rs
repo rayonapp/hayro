@@ -10,20 +10,20 @@ use crate::object::dict::keys::*;
 use crate::object::{Object, ObjectLike};
 use crate::reader::ReaderContext;
 use crate::sync::OnceLock;
+use crate::transform::Transform;
 use crate::util::FloatExt;
 use crate::xref::XRef;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Deref;
-use log::warn;
 
 /// Attributes that can be inherited.
 #[derive(Debug, Clone)]
 struct PagesContext {
     media_box: Option<Rect>,
     crop_box: Option<Rect>,
-    rotate: Option<u32>,
+    rotate: Option<i32>,
 }
 
 impl PagesContext {
@@ -116,7 +116,7 @@ fn resolve_pages<'a>(
         ctx.crop_box = Some(crop_box);
     }
 
-    if let Some(rotate) = pages_dict.get::<u32>(ROTATE) {
+    if let Some(rotate) = pages_dict.get::<i32>(ROTATE) {
         ctx.rotate = Some(rotate);
     }
 
@@ -128,7 +128,7 @@ fn resolve_pages<'a>(
     let kids = pages_dict.get::<Array<'a>>(KIDS)?;
 
     for dict in kids.iter::<Dict<'_>>() {
-        match dict.get::<Name>(TYPE).as_deref() {
+        match dict.get::<Name<'_>>(TYPE).as_deref() {
             Some(PAGES) => {
                 resolve_pages(&dict, entries, ctx.clone(), resources.clone());
             }
@@ -189,7 +189,12 @@ impl<'a> Page<'a> {
             .or(ctx.crop_box)
             .unwrap_or(media_box);
 
-        let rotation = match dict.get::<u32>(ROTATE).or(ctx.rotate).unwrap_or(0) % 360 {
+        let rotation = match dict
+            .get::<i32>(ROTATE)
+            .or(ctx.rotate)
+            .unwrap_or(0)
+            .rem_euclid(360)
+        {
             0 => Rotation::None,
             90 => Rotation::Horizontal,
             180 => Rotation::Flipped,
@@ -331,6 +336,52 @@ impl<'a> Page<'a> {
     pub fn typed_operations(&self) -> TypedIter<'_> {
         TypedIter::from_untyped(self.operations())
     }
+
+    /// Return the initial transform that should be applied when rendering.
+    ///
+    /// This accounts for the mismatch between PDF's y-up and most renderers'
+    /// y-down coordinate system, the rotation of the page and the offset of
+    /// the crop box.
+    pub fn initial_transform(&self, invert_y: bool) -> Transform {
+        let crop_box = self.intersected_crop_box();
+        let (_, base_height) = self.base_dimensions();
+        let (width, height) = self.render_dimensions();
+
+        let horizontal_t = Transform::ROTATE_CW_90 * Transform::translate((0.0, -width as f64));
+        let flipped_horizontal_t =
+            Transform::translate((0.0, height as f64)) * Transform::ROTATE_CCW_90;
+
+        let rotation_transform = match self.rotation() {
+            Rotation::None => Transform::IDENTITY,
+            Rotation::Horizontal => {
+                if invert_y {
+                    horizontal_t
+                } else {
+                    flipped_horizontal_t
+                }
+            }
+            Rotation::Flipped => {
+                Transform::scale(-1.0) * Transform::translate((-width as f64, -height as f64))
+            }
+            Rotation::FlippedHorizontal => {
+                if invert_y {
+                    flipped_horizontal_t
+                } else {
+                    horizontal_t
+                }
+            }
+        };
+
+        let inversion_transform = if invert_y {
+            Transform::new([1.0, 0.0, 0.0, -1.0, 0.0, base_height as f64])
+        } else {
+            Transform::IDENTITY
+        };
+
+        rotation_transform
+            * inversion_transform
+            * Transform::translate((-crop_box.x0, -crop_box.y0))
+    }
 }
 
 /// A structure keeping track of the resources of a page.
@@ -387,7 +438,7 @@ impl<'a> Resources<'a> {
         }
     }
 
-    fn get_resource<T: ObjectLike<'a>>(&self, name: Name, dict: &Dict<'a>) -> Option<T> {
+    fn get_resource<T: ObjectLike<'a>>(&self, name: &Name<'_>, dict: &Dict<'a>) -> Option<T> {
         dict.get::<T>(name.deref())
     }
 
@@ -397,38 +448,38 @@ impl<'a> Resources<'a> {
     }
 
     /// Get an external graphics state by name.
-    pub fn get_ext_g_state(&self, name: Name) -> Option<Dict<'a>> {
-        self.get_resource::<Dict<'_>>(name.clone(), &self.ext_g_states)
+    pub fn get_ext_g_state(&self, name: &Name<'_>) -> Option<Dict<'a>> {
+        self.get_resource::<Dict<'_>>(name, &self.ext_g_states)
             .or_else(|| self.parent.as_ref().and_then(|p| p.get_ext_g_state(name)))
     }
 
     /// Get a color space by name.
-    pub fn get_color_space(&self, name: Name) -> Option<Object<'a>> {
-        self.get_resource::<Object<'_>>(name.clone(), &self.color_spaces)
+    pub fn get_color_space(&self, name: &Name<'_>) -> Option<Object<'a>> {
+        self.get_resource::<Object<'_>>(name, &self.color_spaces)
             .or_else(|| self.parent.as_ref().and_then(|p| p.get_color_space(name)))
     }
 
     /// Get a font by name.
-    pub fn get_font(&self, name: Name) -> Option<Dict<'a>> {
-        self.get_resource::<Dict<'_>>(name.clone(), &self.fonts)
+    pub fn get_font(&self, name: &Name<'_>) -> Option<Dict<'a>> {
+        self.get_resource::<Dict<'_>>(name, &self.fonts)
             .or_else(|| self.parent.as_ref().and_then(|p| p.get_font(name)))
     }
 
     /// Get a pattern by name.
-    pub fn get_pattern(&self, name: Name) -> Option<Object<'a>> {
-        self.get_resource::<Object<'_>>(name.clone(), &self.patterns)
+    pub fn get_pattern(&self, name: &Name<'_>) -> Option<Object<'a>> {
+        self.get_resource::<Object<'_>>(name, &self.patterns)
             .or_else(|| self.parent.as_ref().and_then(|p| p.get_pattern(name)))
     }
 
     /// Get an x object by name.
-    pub fn get_x_object(&self, name: Name) -> Option<Stream<'a>> {
-        self.get_resource::<Stream<'_>>(name.clone(), &self.x_objects)
+    pub fn get_x_object(&self, name: &Name<'_>) -> Option<Stream<'a>> {
+        self.get_resource::<Stream<'_>>(name, &self.x_objects)
             .or_else(|| self.parent.as_ref().and_then(|p| p.get_x_object(name)))
     }
 
     /// Get a shading by name.
-    pub fn get_shading(&self, name: Name) -> Option<Object<'a>> {
-        self.get_resource::<Object<'_>>(name.clone(), &self.shadings)
+    pub fn get_shading(&self, name: &Name<'_>) -> Option<Object<'a>> {
+        self.get_resource::<Object<'_>>(name, &self.shadings)
             .or_else(|| self.parent.as_ref().and_then(|p| p.get_shading(name)))
     }
 }

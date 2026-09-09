@@ -14,8 +14,6 @@ pub trait ReaderExt<'a> {
     fn read_with_context<T: Readable<'a>>(&mut self, ctx: &ReaderContext<'a>) -> Option<T>;
     fn read_without_context<T: Readable<'a>>(&mut self) -> Option<T>;
     fn skip<T: Skippable>(&mut self, is_content_stream: bool) -> Option<&'a [u8]>;
-    fn skip_not_in_content_stream<T: Skippable>(&mut self) -> Option<&'a [u8]>;
-    fn skip_in_content_stream<T: Skippable>(&mut self) -> Option<&'a [u8]>;
     fn skip_white_spaces(&mut self);
     fn read_white_space(&mut self) -> Option<()>;
     fn skip_eol_characters(&mut self);
@@ -49,7 +47,7 @@ impl<'a> ReaderExt<'a> for Reader<'a> {
 
     #[inline]
     fn read_without_context<T: Readable<'a>>(&mut self) -> Option<T> {
-        self.read::<T>(&ReaderContext::dummy_in_content_stream())
+        self.read::<T>(ReaderContext::dummy_ref())
     }
 
     #[inline]
@@ -65,16 +63,6 @@ impl<'a> ReaderExt<'a> for Reader<'a> {
     }
 
     #[inline]
-    fn skip_not_in_content_stream<T: Skippable>(&mut self) -> Option<&'a [u8]> {
-        self.skip::<T>(false)
-    }
-
-    #[inline]
-    fn skip_in_content_stream<T: Skippable>(&mut self) -> Option<&'a [u8]> {
-        self.skip::<T>(false)
-    }
-
-    #[inline]
     fn skip_white_spaces(&mut self) {
         while let Some(b) = self.peek_byte() {
             if is_white_space_character(b) {
@@ -87,7 +75,7 @@ impl<'a> ReaderExt<'a> for Reader<'a> {
 
     #[inline]
     fn read_white_space(&mut self) -> Option<()> {
-        if self.peek_byte()?.is_ascii_whitespace() {
+        if is_white_space_character(self.peek_byte()?) {
             let w = self.read_byte()?;
 
             if w == b'\r' && self.peek_byte().is_some_and(|b| b == b'\n') {
@@ -161,8 +149,8 @@ impl<'a> ReaderContext<'a> {
         })
     }
 
-    pub(crate) fn dummy_in_content_stream() -> Self {
-        Self(ReaderContextInner::Dummy {
+    pub(crate) fn dummy_ref() -> &'static Self {
+        &Self(ReaderContextInner::Dummy {
             in_content_stream: true,
         })
     }

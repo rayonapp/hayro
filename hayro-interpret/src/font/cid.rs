@@ -5,18 +5,18 @@ use crate::font::{
     FallbackFontQuery, FontFlags, FontQuery, read_to_unicode, stretch_glyph, strip_subset_prefix,
 };
 use crate::{CMapResolverFn, CacheKey, FontResolverFn};
-use hayro_cmap::{BfString, CMap, CidFamily, WritingMode};
+use hayro_cmap::{BfString, CMap, CharacterCollection, CidFamily, WritingMode};
+use hayro_syntax::object;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Array, Object};
 use kurbo::{BezPath, Vec2};
-use log::warn;
+use rustc_hash::FxHashMap;
 use skrifa::attribute::Style;
 use skrifa::raw::collections::int_set::Domain;
 use skrifa::{FontRef, GlyphId, MetadataProvider};
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -27,10 +27,10 @@ pub(crate) struct Type0Font {
     cache_key: u128,
     dw: f32,
     dw2: (f32, f32),
-    widths: HashMap<u32, f32>,
+    widths: FxHashMap<u32, f32>,
     encoding: CMap,
     to_unicode: Option<CMap>,
-    widths2: HashMap<u32, [f32; 3]>,
+    widths2: FxHashMap<u32, [f32; 3]>,
     cid_to_gid_map: CidToGIdMap,
     /// PostScript name from the PDF.
     postscript_name: Option<String>,
@@ -61,6 +61,13 @@ impl Type0Font {
             .get::<Dict<'_>>(FONT_DESC)
             .unwrap_or_default();
 
+        let character_collection = cmap
+            .metadata()
+            .character_collection
+            .clone()
+            .filter(|cc| cc.family != CidFamily::AdobeIdentity)
+            .or_else(|| read_cid_system_info(&descendant_font));
+
         let (font_type, fallback, _is_standard_fallback) = match FontType::new(&font_descriptor) {
             Some(ft) => (ft, false, false),
             None => {
@@ -69,7 +76,7 @@ impl Type0Font {
                         (FontQuery::Standard(standard), true)
                     } else {
                         let mut query = FallbackFontQuery::new(dict);
-                        query.character_collection = cmap.metadata().character_collection.clone();
+                        query.character_collection = character_collection.clone();
 
                         warn!(
                             "unable to load CID font {} ({:?}), attempting fallback",
@@ -111,8 +118,7 @@ impl Type0Font {
         // If there is no ToUnicode map, try to get the UCS2 CMap.
         if fallback
             && to_unicode.is_none()
-            && let Some(cc) = cmap.metadata().character_collection.as_ref()
-            && cc.family != CidFamily::AdobeIdentity
+            && let Some(cc) = character_collection.as_ref()
             && let Some(ucs2_name) = cc.family.ucs2_cmap()
             && let Some(data) = (cmap_resolver)(ucs2_name)
         {
@@ -124,7 +130,7 @@ impl Type0Font {
         }
 
         let postscript_name = dict
-            .get::<Name>(BASE_FONT)
+            .get::<Name<'_>>(BASE_FONT)
             .map(|n| strip_subset_prefix(n.as_str()).to_string());
 
         // Extract font flags from descriptor
@@ -176,17 +182,12 @@ impl Type0Font {
         match &self.font_type {
             FontType::OpenType(_) => self.cid_to_gid_map.map(cid as u16),
             FontType::Cff(c) => {
-                let table = c.table();
-
-                if table.is_cid() {
+                if c.is_cid() {
                     // Very confusing stuff going on here, see https://github.com/mozilla/pdf.js/pull/15563.
                     // The PDF spec makes it sounds like cid-to-gid map should only be used for TrueType fonts,
                     // but Acrobat also seems to support it for CFF fonts with some weird behavior.
                     if matches!(self.cid_to_gid_map, CidToGIdMap::Identity) {
-                        table
-                            .glyph_index_by_cid(cid as u16)
-                            .map(|g| GlyphId::new(g.0 as u32))
-                            .unwrap_or(GlyphId::NOTDEF)
+                        c.glyph_index_by_cid(cid as u16).unwrap_or(GlyphId::NOTDEF)
                     } else {
                         GlyphId::new(self.cid_to_gid_map.inverse_map(GlyphId::new(cid)) as u32)
                     }
@@ -227,21 +228,22 @@ impl Type0Font {
         match &self.font_type {
             FontType::OpenType(t) => t.font_ref().charmap().map(character),
             FontType::Cff(c) => {
-                let table = c.table();
-
                 // Map codepoint to glyph name via AFL, and then look it up.
                 if let Some(name) = glyph_names::get_reverse(character)
-                    && let Some(gid) = table.glyph_index_by_name(name)
+                    && let Some(gid) = c.glyph_index_by_name(name)
                 {
-                    Some(GlyphId::new(gid.0 as u32))
+                    Some(gid)
                 } else {
                     None
                 }
             }
-            FontType::Type1(t) => {
-                let name = glyph_names::get_reverse(character)?;
-                let idx = t.table().charstring_index(name)?;
-                Some(GlyphId::new(idx as u32))
+            FontType::Type1(_) => {
+                // We could in theory map to a glyph via AFL and then look up
+                // the glyph index in the encoding, but since skrifa doesn't have
+                // an API for that and this is only really necessary for fallback
+                // fonts (which currently only supports OpenType and CFF as fallback),
+                // so we don't support this for now.
+                None
             }
         }
     }
@@ -260,15 +262,7 @@ impl Type0Font {
         let path = match &self.font_type {
             FontType::OpenType(t) => t.outline_glyph(glyph),
             FontType::Cff(c) => c.outline_glyph(glyph),
-            FontType::Type1(t) => {
-                let name = t
-                    .table()
-                    .charstring_names()
-                    .get(glyph.to_u32() as usize)
-                    .map(|n| n.as_str())
-                    .unwrap_or(".notdef");
-                t.outline_glyph(name)
-            }
+            FontType::Type1(t) => t.outline_glyph(glyph),
         };
 
         if self.fallback
@@ -443,7 +437,7 @@ impl FontType {
             .decoded()
             .ok()?;
 
-        let data = Arc::new(data);
+        let data = Arc::new(data.into_owned());
 
         let parsed = if let Ok(_font_ref) = FontRef::from_index(data.as_ref(), 0) {
             // It's an OpenType font, either TrueType or CFF.
@@ -467,14 +461,14 @@ enum CidToGIdMap {
     #[default]
     Identity,
     Mapped {
-        forward: HashMap<u16, GlyphId>,
-        inverse: HashMap<GlyphId, u16>,
+        forward: FxHashMap<u16, GlyphId>,
+        inverse: FxHashMap<GlyphId, u16>,
     },
 }
 
 impl CidToGIdMap {
     fn new(dict: &Dict<'_>) -> Option<Self> {
-        if let Some(name) = dict.get::<Name>(CID_TO_GID_MAP) {
+        if let Some(name) = dict.get::<Name<'_>>(CID_TO_GID_MAP) {
             if name.deref() == IDENTITY {
                 Some(Self::Identity)
             } else {
@@ -482,8 +476,8 @@ impl CidToGIdMap {
             }
         } else if let Some(stream) = dict.get::<Stream<'_>>(CID_TO_GID_MAP) {
             let decoded = stream.decoded().ok()?;
-            let mut forward = HashMap::new();
-            let mut inverse = HashMap::new();
+            let mut forward = FxHashMap::default();
+            let mut inverse = FxHashMap::default();
 
             for (cid, gid) in decoded.chunks_exact(2).enumerate() {
                 let gid = GlyphId::new(u16::from_be_bytes([gid[0], gid[1]]) as u32);
@@ -515,8 +509,8 @@ impl CidToGIdMap {
     }
 }
 
-fn read_widths(arr: &Array<'_>) -> Option<HashMap<u32, f32>> {
-    let mut map = HashMap::new();
+fn read_widths(arr: &Array<'_>) -> Option<FxHashMap<u32, f32>> {
+    let mut map = FxHashMap::default();
     let mut iter = arr.flex_iter();
 
     loop {
@@ -537,8 +531,8 @@ fn read_widths(arr: &Array<'_>) -> Option<HashMap<u32, f32>> {
     Some(map)
 }
 
-fn read_widths2(arr: &Array<'_>) -> Option<HashMap<u32, [f32; 3]>> {
-    let mut map = HashMap::new();
+fn read_widths2(arr: &Array<'_>) -> Option<FxHashMap<u32, [f32; 3]>> {
+    let mut map = FxHashMap::default();
     let mut iter = arr.flex_iter();
 
     loop {
@@ -561,6 +555,16 @@ fn read_widths2(arr: &Array<'_>) -> Option<HashMap<u32, [f32; 3]>> {
     }
 
     Some(map)
+}
+
+fn read_cid_system_info(descendant_font: &Dict<'_>) -> Option<CharacterCollection> {
+    let info = descendant_font.get::<Dict<'_>>(CIDSYSTEMINFO)?;
+    let registry = info.get::<object::String<'_>>(REGISTRY)?;
+    let ordering = info.get::<object::String<'_>>(ORDERING)?;
+    let supplement = info.get::<i32>(SUPPLEMENT).unwrap_or(0);
+    let family = CidFamily::from_registry_ordering(registry.deref(), ordering.deref());
+
+    Some(CharacterCollection { family, supplement })
 }
 
 fn read_encoding(object: &Object<'_>, cmap_resolver: &CMapResolverFn) -> Option<CMap> {

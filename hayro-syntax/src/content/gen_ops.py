@@ -121,21 +121,21 @@ ops = {
 def rust_type(t: Type) -> str:
     return {
         Type.Number: "Number",
-        Type.String: "object::String",
-        Type.Array: "Array<'a>",
-        Type.Object: "Object<'a>",
-        Type.Stream: "Stream<'a>",
-        Type.Name: "Name",
-        Type.Dict: "Dict<'a>",
+        Type.String: "&'b object::String<'a>",
+        Type.Array: "&'b Array<'a>",
+        Type.Object: "&'b Object<'a>",
+        Type.Stream: "&'b Stream<'a>",
+        Type.Name: "&'b Name<'a>",
+        Type.Dict: "&'b Dict<'a>",
         Type.VecNum: "SmallVec<[Number; OPERANDS_THRESHOLD]>",
     }[t]
 
 
 def lifetime_if_needed(types):
     return (
-        "<'a>"
+        "<'b, 'a>"
         if any(
-            t in [Type.Array, Type.Object, Type.Stream, Type.Dict]
+            t in [Type.Array, Type.Object, Type.Stream, Type.Dict, Type.Name, Type.String]
             for t in types
         )
         else ""
@@ -164,23 +164,28 @@ def gen_struct(name, code, types):
 
 
 def gen_enum_variant(name, types):
-    has_lifetime = (type(types) is list) and any(
-        t in [Type.Array, Type.Object, Type.Stream]
-        for t in types
+    has_lifetime = name in ["StrokeColorNamed", "NonStrokeColorNamed"] or (
+        (type(types) is list)
+        and any(t in [Type.Array, Type.Object, Type.Stream, Type.Name, Type.String] for t in types)
     )
-    inner_type = f"{name}<'a>" if has_lifetime else name
+    inner_type = f"{name}<'b, 'a>" if has_lifetime else name
     return f"{name}({inner_type})"
 
 
 def gen_dispatch_match(code, name, types):
     escaped_code = code.replace('"', '\\"')
-    return f'b"{escaped_code}" => {name}::from_stack(&instruction.operands)?.into(),'
+    return f'b"{escaped_code}" => {name}::from_stack(instruction.operands)?.into(),'
+
+
+def gen_display_match(name, types):
+    return f"Self::{name}(value) => Display::fmt(value, f),"
 
 
 # Generate all code pieces
 structs = []
 enum_variants = []
 dispatch_arms = []
+display_arms = []
 
 for category in ops.values():
     for code, name, types in category:
@@ -188,26 +193,40 @@ for category in ops.values():
             structs.append(gen_struct(name, code, types))
         enum_variants.append(gen_enum_variant(name, types))
         dispatch_arms.append(gen_dispatch_match(code, name, types))
+        display_arms.append(gen_display_match(name, types))
 
 # Build the final Rust code blocks
 struct_block = "\n\n".join(structs)
 
 enum_block = (
     "#[derive(Debug, PartialEq, Clone)]\n"
-    "pub enum TypedInstruction<'a> {\n" + "    " + ",\n    ".join(enum_variants) + ",\n"
-    "    Fallback(Operator),\n}"
+    "pub enum TypedInstruction<'b, 'a> {\n" + "    " + ",\n    ".join(enum_variants) + ",\n"
+    "    Fallback(&'b Operator<'a>),\n}"
+)
+
+display_block = (
+    "impl Display for TypedInstruction<'_, '_> {\n"
+    "    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {\n"
+    "        match self {\n"
+    + "            "
+    + "\n            ".join(display_arms)
+    + "\n"
+    "            Self::Fallback(operator) => write!(f, \"Fallback({operator})\"),\n"
+    "        }\n"
+    "    }\n"
+    "}"
 )
 
 dispatch_block = (
-    "impl<'a> TypedInstruction<'a> {\n"
+    "impl<'b, 'a> TypedInstruction<'b, 'a> {\n"
     "    #[inline(always)]\n"
-    "    pub(crate) fn dispatch(instruction: &Instruction<'a>) -> Option<Self> {\n"
+    "    pub(crate) fn dispatch(instruction: &Instruction<'b, 'a>) -> Option<Self> {\n"
     "        let op_name = instruction.operator.as_ref();\n"
     "        Some(match op_name {\n"
     + "            "
     + "\n            ".join(dispatch_arms)
     + "\n"
-    "            _ => return Self::Fallback(instruction.operator.clone()).into(),\n"
+    "            _ => return Some(Self::Fallback(instruction.operator)),\n"
     "        })\n"
     "    }\n"
     "}"
@@ -216,7 +235,9 @@ dispatch_block = (
 gen_notice = "// THIS FILE IS AUTO-GENERATED, DO NOT EDIT MANUALLY"
 imports = "use crate::content::Operator;"
 
-joined = "\n\n".join([gen_notice, imports, struct_block, enum_block, dispatch_block])
+joined = "\n\n".join(
+    [gen_notice, imports, struct_block, enum_block, display_block, dispatch_block]
+)
 
 with open("ops_generated.rs", "w") as f:
     f.write(joined)

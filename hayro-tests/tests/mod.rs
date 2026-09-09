@@ -5,14 +5,12 @@ use hayro_svg::SvgRenderSettings;
 use hayro_syntax::Pdf;
 use hayro_syntax::{DecryptionError, LoadPdfError};
 use image::{Rgba, RgbaImage, load_from_memory};
-use once_cell::sync::Lazy;
-use resvg::tiny_skia::Pixmap;
+use resvg::tiny_skia::{Color, Pixmap, PixmapPaint};
 use resvg::usvg::{Options, Transform, Tree};
-use sitro::{RenderOptions, Renderer};
 use std::cmp::max;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 #[rustfmt::skip]
 #[allow(non_snake_case)]
@@ -24,23 +22,23 @@ mod write;
 const REPLACE: Option<&str> = option_env!("REPLACE");
 const STORE: Option<&str> = option_env!("STORE");
 
-pub(crate) static WORKSPACE_PATH: Lazy<PathBuf> =
-    Lazy::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(""));
+pub(crate) static WORKSPACE_PATH: LazyLock<PathBuf> =
+    LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(""));
 
-pub(crate) static DIFFS_PATH: Lazy<PathBuf> = Lazy::new(|| {
+pub(crate) static DIFFS_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let path = WORKSPACE_PATH.join("diffs");
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::create_dir_all(&path);
 
     path
 });
-pub(crate) static RENDER_SNAPSHOTS_PATH: Lazy<PathBuf> =
-    Lazy::new(|| WORKSPACE_PATH.join("snapshots/render"));
-pub(crate) static SVG_SNAPSHOTS_PATH: Lazy<PathBuf> =
-    Lazy::new(|| WORKSPACE_PATH.join("snapshots/svg"));
-pub(crate) static WRITE_SNAPSHOTS_PATH: Lazy<PathBuf> =
-    Lazy::new(|| WORKSPACE_PATH.join("snapshots/write"));
-pub(crate) static STORE_PATH: Lazy<PathBuf> = Lazy::new(|| WORKSPACE_PATH.join("store"));
+pub(crate) static RENDER_SNAPSHOTS_PATH: LazyLock<PathBuf> =
+    LazyLock::new(|| WORKSPACE_PATH.join("snapshots/render"));
+pub(crate) static SVG_SNAPSHOTS_PATH: LazyLock<PathBuf> =
+    LazyLock::new(|| WORKSPACE_PATH.join("snapshots/svg"));
+pub(crate) static WRITE_SNAPSHOTS_PATH: LazyLock<PathBuf> =
+    LazyLock::new(|| WORKSPACE_PATH.join("snapshots/write"));
+pub(crate) static STORE_PATH: LazyLock<PathBuf> = LazyLock::new(|| WORKSPACE_PATH.join("store"));
 
 type RenderedDocument = Vec<Vec<u8>>;
 type RenderedPage = Vec<u8>;
@@ -50,6 +48,8 @@ pub fn check_render(name: &str, snapshot_path: PathBuf, document: RenderedDocume
         snapshot_path.join("pdfjs")
     } else if name.starts_with("pdfbox_") {
         snapshot_path.join("pdfbox")
+    } else if name.starts_with("pdfium_") {
+        snapshot_path.join("pdfium")
     } else if name.starts_with("corpus_") {
         snapshot_path.join("corpus")
     } else {
@@ -62,6 +62,8 @@ pub fn check_render(name: &str, snapshot_path: PathBuf, document: RenderedDocume
     let snapshot_name = if let Some(name) = name.strip_prefix("pdfjs_") {
         name
     } else if let Some(name) = name.strip_prefix("pdfbox_") {
+        name
+    } else if let Some(name) = name.strip_prefix("pdfium_") {
         name
     } else if let Some(name) = name.strip_prefix("corpus_") {
         name
@@ -224,7 +226,7 @@ fn get_noto_fallback(query: &hayro::hayro_interpret::font::FallbackFontQuery) ->
 
 fn svg_render_settings() -> SvgRenderSettings {
     SvgRenderSettings {
-        bg_color: [255, 255, 255, 255],
+        bg_color: [0, 0, 0, 0],
     }
 }
 
@@ -282,6 +284,7 @@ fn render_svg(
     render_settings: SvgRenderSettings,
     range: Option<RangeInclusive<usize>>,
 ) -> Vec<Vec<u8>> {
+    let cache = hayro_svg::RenderCache::new();
     pdf.pages()
         .iter()
         .enumerate()
@@ -290,7 +293,7 @@ fn render_svg(
                 return None;
             }
 
-            let svg = hayro_svg::convert(p, &interpreter_settings, &render_settings);
+            let svg = hayro_svg::convert(p, &cache, &interpreter_settings, &render_settings);
 
             if STORE.is_some() {
                 let dir = STORE_PATH.join("svg");
@@ -300,13 +303,26 @@ fn render_svg(
             }
 
             let tree = Tree::from_data(svg.as_bytes(), &Options::default()).unwrap();
-            let mut pixmap = Pixmap::new(
+            let mut rendered = Pixmap::new(
                 tree.size().width().ceil() as u32,
                 tree.size().height().ceil() as u32,
             )
             .unwrap();
-            resvg::render(&tree, Transform::default(), &mut pixmap.as_mut());
-            Some(pixmap.encode_png().unwrap())
+            resvg::render(&tree, Transform::default(), &mut rendered.as_mut());
+
+            // A workaround for https://github.com/linebender/resvg/issues/1069
+            let mut composited = Pixmap::new(rendered.width(), rendered.height()).unwrap();
+            composited.fill(Color::from_rgba8(255, 255, 255, 255));
+            composited.draw_pixmap(
+                0,
+                0,
+                rendered.as_ref(),
+                &PixmapPaint::default(),
+                Transform::default(),
+                None,
+            );
+
+            Some(composited.encode_png().unwrap())
         })
         .collect::<Vec<_>>()
 }
@@ -321,13 +337,7 @@ pub fn run_svg_test(name: &str, file_path: &str, range_str: Option<&str>) {
     check_render(name, SVG_SNAPSHOTS_PATH.clone(), converted);
 }
 
-pub fn run_write_test(
-    name: &str,
-    file_path: &str,
-    page_indices: &[usize],
-    renderer: Renderer,
-    page: bool,
-) {
+pub fn run_write_test(name: &str, file_path: &str, page_indices: &[usize], page: bool) {
     let hayro_pdf = load_pdf(file_path);
 
     let buf = if page {
@@ -342,9 +352,8 @@ pub fn run_write_test(
         std::fs::write(STORE_PATH.join(format!("{name}.pdf")), &buf).unwrap();
     }
 
-    let rendered = renderer
-        .render_as_png(&buf, &RenderOptions::default())
-        .unwrap();
+    let pdf = Pdf::new(buf).unwrap();
+    let rendered = render_pdf(&pdf, name, interpreter_settings(), None);
     check_render(name, WRITE_SNAPSHOTS_PATH.clone(), rendered);
 }
 
@@ -367,9 +376,9 @@ pub fn get_diff(expected_image: &RgbaImage, actual_image: &RgbaImage) -> (RgbaIm
                     diff_image.put_pixel(x + 2 * width, y, *actual);
                     if is_pix_diff(expected, actual) {
                         pixel_diff += 1;
-                        diff_image.put_pixel(x + width, y, Rgba([255, 0, 0, 255]));
+                        diff_image.put_pixel(x + width, y, diff_pixel(expected, actual));
                     } else {
-                        diff_image.put_pixel(x + width, y, Rgba([0, 0, 0, 255]))
+                        diff_image.put_pixel(x + width, y, diff_pixel(expected, actual))
                     }
                 }
                 (Some(actual), None) => {
@@ -392,6 +401,22 @@ pub fn get_diff(expected_image: &RgbaImage, actual_image: &RgbaImage) -> (RgbaIm
     }
 
     (diff_image, pixel_diff)
+}
+
+fn diff_pixel(pixel1: &Rgba<u8>, pixel2: &Rgba<u8>) -> Rgba<u8> {
+    if pixel1.0[3] == 0 && pixel2.0[3] == 0 {
+        return Rgba([0, 0, 0, 255]);
+    }
+
+    let max_channel_deviation = pixel1
+        .0
+        .iter()
+        .zip(pixel2.0.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+
+    Rgba([max_channel_deviation, 0, 0, 255])
 }
 
 fn is_pix_diff(pixel1: &Rgba<u8>, pixel2: &Rgba<u8>) -> bool {

@@ -1,12 +1,14 @@
 [package]
 name = "hayro-jpeg2000"
-version = "0.3.2"
+version = "0.4.0"
 description = "A memory-safe, pure-Rust JPEG 2000 decoder."
 authors = { workspace = true }
 edition = { workspace = true }
+rust-version = { workspace = true }
 repository = { workspace = true }
 license = { workspace = true }
 readme = "README.md"
+exclude = ["/tests/", "/manifest_*.json", "/sync.py", "/TESTS.md", "/benches/"]
 
 [dependencies]
 log = { workspace = true, optional = true }
@@ -29,6 +31,7 @@ logging = ["dep:log"]
 workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 image = { workspace = true, default-features = false, features = ["png"] }
 indicatif = { version = "0.17", features = ["rayon"] }
 rayon = "1.11"
@@ -38,4 +41,8 @@ serde_json = "1"
 [[test]]
 name = "asset_suite"
 path = "tests/mod.rs"
+harness = false
+
+[[bench]]
+name = "decode"
 harness = false

@@ -4,7 +4,6 @@ use hayro_syntax::object::Number;
 use hayro_syntax::object::Stream;
 use hayro_syntax::reader::Reader;
 use hayro_syntax::reader::{ReaderContext, ReaderExt};
-use log::error;
 use smallvec::SmallVec;
 use std::array;
 use std::ops::Rem;
@@ -498,7 +497,7 @@ impl PostScriptOp {
             // TODO: Support radix numbers
             Self::Number(n)
         } else {
-            let op = r.read::<content::Operator>(&ReaderContext::dummy())?;
+            let op = r.read::<content::Operator<'_>>(&ReaderContext::dummy())?;
             match op.as_ref() {
                 b"abs" => Self::Abs,
                 b"add" => Self::Add,
@@ -578,7 +577,7 @@ mod tests {
             vec![
                 PostScriptOp::Copy,
                 PostScriptOp::Dup,
-                PostScriptOp::Number(Number::from_i32(2)),
+                PostScriptOp::Number(Number::from_f32(2.0)),
                 PostScriptOp::Exch,
                 PostScriptOp::Roll,
             ]

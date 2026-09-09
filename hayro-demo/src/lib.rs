@@ -1,8 +1,6 @@
-use console_error_panic_hook;
-use hayro::RenderSettings;
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
-use js_sys;
+use hayro::{RenderCache, RenderSettings};
 use vello_cpu::color::palette::css::WHITE;
 use wasm_bindgen::prelude::*;
 
@@ -36,13 +34,12 @@ impl log::Log for ConsoleLogger {
                 _ => web_sys::console::log_1(&message.clone().into()),
             }
 
-            if let Some(window) = web_sys::window() {
-                if let Ok(add_log_entry) = js_sys::Reflect::get(&window, &"addLogEntry".into()) {
-                    if add_log_entry.is_function() {
-                        let function = js_sys::Function::from(add_log_entry);
-                        let _ = function.call2(&window, &level_str.into(), &message.into());
-                    }
-                }
+            if let Some(window) = web_sys::window()
+                && let Ok(add_log_entry) = js_sys::Reflect::get(&window, &"addLogEntry".into())
+                && add_log_entry.is_function()
+            {
+                let function = js_sys::Function::from(add_log_entry);
+                let _ = function.call2(&window, &level_str.into(), &message.into());
             }
         }
     }
@@ -55,8 +52,13 @@ static LOGGER: ConsoleLogger = ConsoleLogger;
 #[wasm_bindgen]
 pub struct PdfViewer {
     pdf: Option<Pdf>,
-    current_page: usize,
     total_pages: usize,
+}
+
+impl Default for PdfViewer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[wasm_bindgen]
@@ -71,7 +73,6 @@ impl PdfViewer {
 
         Self {
             pdf: None,
-            current_page: 0,
             total_pages: 0,
         }
     }
@@ -84,36 +85,42 @@ impl PdfViewer {
 
         self.total_pages = pages.len();
         self.pdf = Some(pdf);
-        self.current_page = 0;
 
         Ok(())
     }
 
     #[wasm_bindgen]
-    pub fn render_current_page(
+    pub fn render_page(
         &self,
+        page_number: usize,
         viewport_width: f32,
         viewport_height: f32,
         device_pixel_ratio: f32,
+        zoom: f32,
+        fit_width: bool,
     ) -> Result<js_sys::Array, JsValue> {
         let pdf = self.pdf.as_ref().ok_or("No PDF loaded")?;
         let page = pdf
             .pages()
-            .get(self.current_page)
+            .get(page_number.checked_sub(1).ok_or("Page out of bounds")?)
             .ok_or("Page out of bounds")?;
 
         let interpreter_settings = InterpreterSettings::default();
         let (base_width, base_height) = page.render_dimensions();
 
-        // Calculate scale to fit in viewport (accounting for device pixel ratio)
-        let target_width = viewport_width * device_pixel_ratio;
-        let target_height = viewport_height * device_pixel_ratio;
+        // Calculate scale to fit in the viewport while accounting for the device pixel ratio.
+        let target_width = viewport_width.max(1.0) * device_pixel_ratio.max(1.0);
+        let target_height = viewport_height.max(1.0) * device_pixel_ratio.max(1.0);
 
         let scale_x = target_width / base_width;
         let scale_y = target_height / base_height;
-        let scale = scale_x.min(scale_y);
+        let fit_scale = if fit_width {
+            scale_x
+        } else {
+            scale_x.min(scale_y)
+        };
+        let scale = fit_scale * zoom.clamp(0.1, 4.0);
 
-        // Render at the calculated scale
         let render_settings = RenderSettings {
             x_scale: scale,
             y_scale: scale,
@@ -121,7 +128,8 @@ impl PdfViewer {
             ..Default::default()
         };
 
-        let pixmap = hayro::render(page, &interpreter_settings, &render_settings);
+        let cache = RenderCache::new();
+        let pixmap = hayro::render(page, &cache, &interpreter_settings, &render_settings);
 
         // Return array: [width, height, pixel_data]
         let result = js_sys::Array::new_with_length(3);
@@ -137,38 +145,17 @@ impl PdfViewer {
     }
 
     #[wasm_bindgen]
-    pub fn next_page(&mut self) -> bool {
-        if self.current_page + 1 < self.total_pages {
-            self.current_page += 1;
-            true
-        } else {
-            false
-        }
-    }
+    pub fn get_page_dimensions(&self) -> Result<js_sys::Array, JsValue> {
+        let pdf = self.pdf.as_ref().ok_or("No PDF loaded")?;
+        let dimensions = js_sys::Array::new();
 
-    #[wasm_bindgen]
-    pub fn previous_page(&mut self) -> bool {
-        if self.current_page > 0 {
-            self.current_page -= 1;
-            true
-        } else {
-            false
+        for page in pdf.pages().iter() {
+            let (width, height) = page.render_dimensions();
+            dimensions.push(&JsValue::from(width));
+            dimensions.push(&JsValue::from(height));
         }
-    }
 
-    #[wasm_bindgen]
-    pub fn set_page(&mut self, page: usize) -> bool {
-        if page > 0 && page <= self.total_pages {
-            self.current_page = page - 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    #[wasm_bindgen]
-    pub fn get_current_page(&self) -> usize {
-        self.current_page + 1
+        Ok(dimensions)
     }
 
     #[wasm_bindgen]

@@ -1,8 +1,6 @@
 //! A number of utility methods.
 
-use hayro_syntax::page::{Page, Rotation};
-use kurbo::{Affine, BezPath, PathEl, Rect};
-use log::warn;
+use kurbo::{BezPath, PathEl, Rect};
 use siphasher::sip128::{Hasher128, SipHasher13};
 use std::hash::Hash;
 use std::ops::Sub;
@@ -13,9 +11,9 @@ pub(crate) trait OptionLog {
 
 impl<T> OptionLog for Option<T> {
     #[inline]
-    fn warn_none(self, f: &str) -> Self {
+    fn warn_none(self, _f: &str) -> Self {
         self.or_else(|| {
-            warn!("{f}");
+            warn!("{_f}");
 
             None
         })
@@ -160,6 +158,18 @@ impl BezPathExt for BezPath {
     }
 }
 
+/// Extension methods for converting a [`hayro_syntax::transform::Transform`] to a [`kurbo::Affine`].
+pub trait TransformExt {
+    /// Convert to a `kurbo::Affine`.
+    fn to_kurbo(&self) -> kurbo::Affine;
+}
+
+impl TransformExt for hayro_syntax::transform::Transform {
+    fn to_kurbo(&self) -> kurbo::Affine {
+        kurbo::Affine::new(self.as_coeffs())
+    }
+}
+
 /// Extension methods for rectangles.
 pub trait RectExt {
     /// Convert the rectangle to a `kurbo` rectangle.
@@ -172,53 +182,19 @@ impl RectExt for hayro_syntax::object::Rect {
     }
 }
 
-// Note: Keep in sync with `hayro-write`.
-/// Extension methods for PDF pages.
-pub trait PageExt {
-    /// Return the initial transform that should be applied when rendering. This accounts for a
-    /// number of factors, such as the mismatch between PDF's y-up and most renderers' y-down
-    /// coordinate system, the rotation of the page and the offset of the crop box.
-    fn initial_transform(&self, invert_y: bool) -> Affine;
-}
+/// Return the vectors by which a point in the transformed space moves when
+/// advancing by one unit in the x or y direction, ignoring translation.
+pub fn x_y_advances(transform: &kurbo::Affine) -> (kurbo::Vec2, kurbo::Vec2) {
+    let scale_skew_transform = {
+        let c = transform.as_coeffs();
+        kurbo::Affine::new([c[0], c[1], c[2], c[3], 0.0, 0.0])
+    };
 
-impl PageExt for Page<'_> {
-    fn initial_transform(&self, invert_y: bool) -> Affine {
-        let crop_box = self.intersected_crop_box();
-        let (_, base_height) = self.base_dimensions();
-        let (width, height) = self.render_dimensions();
+    let x_advance = scale_skew_transform * kurbo::Point::new(1.0, 0.0);
+    let y_advance = scale_skew_transform * kurbo::Point::new(0.0, 1.0);
 
-        let horizontal_t =
-            Affine::rotate(90.0_f64.to_radians()) * Affine::translate((0.0, -width as f64));
-        let flipped_horizontal_t =
-            Affine::translate((0.0, height as f64)) * Affine::rotate(-90.0_f64.to_radians());
-
-        let rotation_transform = match self.rotation() {
-            Rotation::None => Affine::IDENTITY,
-            Rotation::Horizontal => {
-                if invert_y {
-                    horizontal_t
-                } else {
-                    flipped_horizontal_t
-                }
-            }
-            Rotation::Flipped => {
-                Affine::scale(-1.0) * Affine::translate((-width as f64, -height as f64))
-            }
-            Rotation::FlippedHorizontal => {
-                if invert_y {
-                    flipped_horizontal_t
-                } else {
-                    horizontal_t
-                }
-            }
-        };
-
-        let inversion_transform = if invert_y {
-            Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, base_height as f64])
-        } else {
-            Affine::IDENTITY
-        };
-
-        rotation_transform * inversion_transform * Affine::translate((-crop_box.x0, -crop_box.y0))
-    }
+    (
+        kurbo::Vec2::new(x_advance.x, x_advance.y),
+        kurbo::Vec2::new(y_advance.x, y_advance.y),
+    )
 }

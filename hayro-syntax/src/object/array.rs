@@ -6,9 +6,8 @@ use crate::object::{FromBytes, Object, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use alloc::vec::Vec;
-use core::fmt::{Debug, Formatter};
+use core::fmt::{Debug, Display, Formatter};
 use core::marker::PhantomData;
-use log::warn;
 use smallvec::SmallVec;
 
 /// An array of PDF objects.
@@ -63,7 +62,20 @@ impl Debug for Array<'_> {
             debug_list.entry(&i);
         });
 
-        Ok(())
+        debug_list.finish()
+    }
+}
+
+impl Display for Array<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.write_str("[")?;
+        for (index, item) in self.raw_iter().enumerate() {
+            if index > 0 {
+                f.write_str(" ")?;
+            }
+            Display::fmt(&item, f)?;
+        }
+        f.write_str("]")
     }
 }
 
@@ -79,9 +91,9 @@ impl Skippable for Array<'_> {
             if let Some(()) = r.forward_tag(b"]") {
                 return Some(());
             } else if is_content_stream {
-                r.skip_not_in_content_stream::<Object<'_>>()?;
+                r.skip::<Object<'_>>(true)?;
             } else {
-                r.skip_not_in_content_stream::<MaybeRef<Object<'_>>>()?;
+                r.skip::<MaybeRef<Object<'_>>>(false)?;
             }
         }
     }
@@ -313,9 +325,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::object::Array;
     use crate::object::Object;
     use crate::object::r#ref::{MaybeRef, ObjRef};
+    use crate::object::{Array, FromBytes};
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
     use crate::xref::XRef;
@@ -393,6 +405,16 @@ mod tests {
     }
 
     #[test]
+    fn malformed_ref_is_not_valid_array() {
+        assert!(array_ref_impl(b"[8 0R]").is_none());
+    }
+
+    #[test]
+    fn array_with_single_number_is_valid() {
+        assert!(array_ref_impl(b"[345345345]").is_some());
+    }
+
+    #[test]
     fn array_with_comment() {
         let res = array_impl(b"[true % A comment \n false]").unwrap();
         assert!(matches!(res[0], Object::Boolean(_)));
@@ -404,5 +426,19 @@ mod tests {
         let res = array_impl(b"[(Hi) /Test]trialing data").unwrap();
         assert!(matches!(res[0], Object::String(_)));
         assert!(matches!(res[1], Object::Name(_)));
+    }
+
+    #[test]
+    fn array_repr() {
+        let array = Array::from_bytes(b"[34]").unwrap();
+
+        assert_eq!(format!("{array:?}"), "[Number(Number(Integer(34)))]");
+    }
+
+    #[test]
+    fn display() {
+        let array = Array::from_bytes(b"[  34 % comment\n /Test  [1   2] ]").unwrap();
+
+        assert_eq!(format!("{array}"), "[34 /Test [1 2]]");
     }
 }

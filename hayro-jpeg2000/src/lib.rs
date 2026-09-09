@@ -10,12 +10,13 @@ changes in tile-parts), but all features that actually commonly appear in real-l
 images should be supported (if not, please open an issue!).
 
 The decoder abstracts away most of the internal complexity of JPEG2000
-and yields a simple 8-bit image with either greyscale, RGB, CMYK or an ICC-based
-color space, which can then be processed further according to your needs.
+and yields decoded image components, which can be inspected directly or packed
+into a simple 8-bit image with either greyscale, RGB, CMYK or an ICC-based color
+space.
 
 # Example
 ```rust,no_run
-use hayro_jpeg2000::{Image, DecodeSettings};
+use hayro_jpeg2000::{DecodeSettings, DecoderContext, Image};
 
 let data = std::fs::read("image.jp2").unwrap();
 let image = Image::new(&data, &DecodeSettings::default()).unwrap();
@@ -28,7 +29,9 @@ println!(
     image.has_alpha(),
 );
 
-let bitmap = image.decode().unwrap();
+let mut ctx = DecoderContext::default();
+let decoded = image.decode(&mut ctx).unwrap();
+let bitmap = decoded.data_u8();
 ```
 
 If you want to see a more comprehensive example, please take a look
@@ -71,12 +74,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::{bail, err};
-use crate::j2c::{ComponentData, DecodedCodestream, Header};
+use crate::j2c::Header;
+use crate::jp2::ImageBoxes;
 use crate::jp2::cdef::{ChannelAssociation, ChannelType};
 use crate::jp2::cmap::ComponentMappingType;
 use crate::jp2::colr::{CieLab, EnumeratedColorspace};
 use crate::jp2::icc::ICCMetadata;
-use crate::jp2::{DecodedImage, ImageBoxes};
 
 pub mod error;
 #[macro_use]
@@ -88,6 +91,8 @@ pub use error::{
     ColorError, DecodeError, DecodingError, FormatError, MarkerError, Result, TileError,
     ValidationError,
 };
+pub use j2c::{ComponentData, DecoderContext};
+pub use jp2::DecodedImage;
 
 #[cfg(feature = "image")]
 pub mod integration;
@@ -190,40 +195,32 @@ impl<'a> Image<'a> {
         self.header.component_infos[0].size_info.precision
     }
 
-    /// Decode the image.
-    pub fn decode(&self) -> Result<Vec<u8>> {
-        let buffer_size = self.width() as usize
-            * self.height() as usize
-            * (self.color_space.num_channels() as usize + if self.has_alpha { 1 } else { 0 });
-        let mut buf = vec![0; buffer_size];
-        self.decode_into(&mut buf)?;
-
-        Ok(buf)
-    }
-
-    /// Decode the image into the given buffer. The buffer must have the correct
-    /// size.
-    pub(crate) fn decode_into(&self, buf: &mut [u8]) -> Result<()> {
+    /// Decode the image and return its decoded components.
+    pub fn decode<'b>(
+        &'a self,
+        decoder_context: &'b mut DecoderContext<'a>,
+    ) -> Result<DecodedImage<'b>> {
         let settings = &self.settings;
-        let mut decoded_image =
-            j2c::decode(self.codestream, &self.header).map(move |data| DecodedImage {
-                decoded: DecodedCodestream { components: data },
-                boxes: self.boxes.clone(),
-            })?;
+        j2c::decode(self.codestream, &self.header, decoder_context)?;
+        let mut decoded_image = DecodedImage {
+            decoded_components: &mut decoder_context.channel_data,
+            boxes: self.boxes.clone(),
+        };
 
         // Resolve palette indices.
         if settings.resolve_palette_indices {
-            decoded_image.decoded.components =
-                resolve_palette_indices(decoded_image.decoded.components, &decoded_image.boxes)?;
+            let components = core::mem::take(decoded_image.decoded_components);
+            *decoded_image.decoded_components =
+                resolve_palette_indices(components, &decoded_image.boxes)?;
         }
 
         if let Some(cdef) = &decoded_image.boxes.channel_definition {
             // Sort by the channel association. Note that this will only work if
             // each component is referenced only once.
             let mut components = decoded_image
-                .decoded
-                .components
-                .into_iter()
+                .decoded_components
+                .iter()
+                .cloned()
                 .zip(
                     cdef.channel_definitions
                         .iter()
@@ -234,16 +231,14 @@ impl<'a> Image<'a> {
                 )
                 .collect::<Vec<_>>();
             components.sort_by(|c1, c2| c1.1.cmp(&c2.1));
-            decoded_image.decoded.components = components.into_iter().map(|c| c.0).collect();
+            *decoded_image.decoded_components = components.into_iter().map(|c| c.0).collect();
         }
 
         // Note that this is only valid if all images have the same bit depth.
-        let bit_depth = decoded_image.decoded.components[0].bit_depth;
+        let bit_depth = decoded_image.decoded_components[0].bit_depth;
         convert_color_space(&mut decoded_image, bit_depth)?;
 
-        interleave_and_convert(decoded_image, buf);
-
-        Ok(())
+        Ok(decoded_image)
     }
 }
 
@@ -375,8 +370,31 @@ pub struct Bitmap {
     pub original_bit_depth: u8,
 }
 
-fn interleave_and_convert(image: DecodedImage, buf: &mut [u8]) {
-    let mut components = image.decoded.components;
+impl DecodedImage<'_> {
+    /// The decoded components of the image.
+    pub fn components(&self) -> &[ComponentData] {
+        self.decoded_components
+    }
+
+    /// Return the decoded image as interleaved unsigned 8-bit sample data.
+    pub fn data_u8(&self) -> Vec<u8> {
+        let components = self.components();
+        let buffer_size = components[0].samples().len() * components.len();
+        let mut buf = vec![0; buffer_size];
+        self.store_u8_into(&mut buf);
+        buf
+    }
+
+    /// Store the decoded image as interleaved unsigned 8-bit sample data into `buf`.
+    ///
+    /// The buffer must have the correct size.
+    pub fn store_u8_into(&self, buf: &mut [u8]) {
+        interleave_and_convert(self, buf);
+    }
+}
+
+fn interleave_and_convert(image: &DecodedImage<'_>, buf: &mut [u8]) {
+    let components = &*image.decoded_components;
     let num_components = components.len();
 
     let mut all_same_bit_depth = Some(components[0].bit_depth);
@@ -407,8 +425,8 @@ fn interleave_and_convert(image: DecodedImage, buf: &mut [u8]) {
             }
             // Gray-scale with alpha.
             2 => {
-                let c1 = components.pop().unwrap();
-                let c0 = components.pop().unwrap();
+                let c0 = &components[0];
+                let c1 = &components[1];
 
                 let c0 = &c0.container[..max_len];
                 let c1 = &c1.container[..max_len];
@@ -420,9 +438,9 @@ fn interleave_and_convert(image: DecodedImage, buf: &mut [u8]) {
             }
             // RGB
             3 => {
-                let c2 = components.pop().unwrap();
-                let c1 = components.pop().unwrap();
-                let c0 = components.pop().unwrap();
+                let c0 = &components[0];
+                let c1 = &components[1];
+                let c2 = &components[2];
 
                 let c0 = &c0.container[..max_len];
                 let c1 = &c1.container[..max_len];
@@ -436,10 +454,10 @@ fn interleave_and_convert(image: DecodedImage, buf: &mut [u8]) {
             }
             // RGBA or CMYK.
             4 => {
-                let c3 = components.pop().unwrap();
-                let c2 = components.pop().unwrap();
-                let c1 = components.pop().unwrap();
-                let c0 = components.pop().unwrap();
+                let c0 = &components[0];
+                let c1 = &components[1];
+                let c2 = &components[2];
+                let c3 = &components[3];
 
                 let c0 = &c0.container[..max_len];
                 let c1 = &c1.container[..max_len];
@@ -470,7 +488,7 @@ fn interleave_and_convert(image: DecodedImage, buf: &mut [u8]) {
     }
 }
 
-fn convert_color_space(image: &mut DecodedImage, bit_depth: u8) -> Result<()> {
+fn convert_color_space(image: &mut DecodedImage<'_>, bit_depth: u8) -> Result<()> {
     if let Some(jp2::colr::ColorSpace::Enumerated(e)) = &image
         .boxes
         .color_specification
@@ -480,12 +498,12 @@ fn convert_color_space(image: &mut DecodedImage, bit_depth: u8) -> Result<()> {
         match e {
             EnumeratedColorspace::Sycc => {
                 dispatch!(Level::new(), simd => {
-                    sycc_to_rgb(simd, &mut image.decoded.components, bit_depth)
+                    sycc_to_rgb(simd, image.decoded_components, bit_depth)
                 })?;
             }
             EnumeratedColorspace::CieLab(cielab) => {
                 dispatch!(Level::new(), simd => {
-                    cielab_to_rgb(simd, &mut image.decoded.components, bit_depth, cielab)
+                    cielab_to_rgb(simd, image.decoded_components, bit_depth, cielab)
                 })?;
             }
             _ => {}
@@ -625,7 +643,7 @@ fn cielab_to_rgb<S: Simd>(
 
     let rl = lab.rl.unwrap_or(100);
     let ra = lab.ra.unwrap_or(170);
-    let rb = lab.ra.unwrap_or(200);
+    let rb = lab.rb.unwrap_or(200);
     let ol = lab.ol.unwrap_or(0);
     let oa = lab.oa.unwrap_or(1 << (bit_depth - 1));
     let ob = lab

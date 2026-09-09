@@ -1,12 +1,12 @@
 use crate::util::hash128;
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Null, ObjRef, Object, Stream};
-use kurbo::Affine;
+use kurbo::{Affine, Rect};
+use rustc_hash::FxHashMap;
 use std::any::Any;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 
-type CacheMap = HashMap<u128, Option<Box<dyn Any + Send + Sync>>>;
+type CacheMap = FxHashMap<u128, Option<Box<dyn Any + Send + Sync>>>;
 #[derive(Clone)]
 pub(crate) struct Cache(Arc<Mutex<CacheMap>>);
 
@@ -18,7 +18,7 @@ impl Default for Cache {
 
 impl Cache {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(Mutex::new(HashMap::new())))
+        Self(Arc::new(Mutex::new(FxHashMap::default())))
     }
 
     pub(crate) fn get_or_insert_with<T: Clone + Send + Sync + 'static>(
@@ -92,13 +92,13 @@ impl CacheKey for hayro_syntax::object::Number {
     }
 }
 
-impl CacheKey for hayro_syntax::object::String {
+impl CacheKey for hayro_syntax::object::String<'_> {
     fn cache_key(&self) -> u128 {
         hash128(self.as_ref())
     }
 }
 
-impl CacheKey for Name {
+impl CacheKey for Name<'_> {
     fn cache_key(&self) -> u128 {
         hash128(self)
     }
@@ -150,6 +150,17 @@ impl CacheKey for Affine {
             c[3].to_bits(),
             c[4].to_bits(),
             c[5].to_bits(),
+        ])
+    }
+}
+
+impl CacheKey for Rect {
+    fn cache_key(&self) -> u128 {
+        hash128(&[
+            self.x0.to_bits(),
+            self.y0.to_bits(),
+            self.x1.to_bits(),
+            self.y1.to_bits(),
         ])
     }
 }

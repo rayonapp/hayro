@@ -51,4 +51,17 @@ There are currently four different categories of tests:
 - Write tests: Those are for the `hayro-write` crate, which is considered internal. You can ignore those.
 
 ## Other
-The `blacklist_*.txt` files are simply meant as a temporary file to keep track of pdf.js/PDFBox files that don't render correctly yet. The Rust scripts in the `src` directory are meant for manual testing and can also be ignored.
+The eventual goal is to have test PDFs from all major issue trackers (pdf.js, PDFBox, mupdf/ghostscript and Chromium) in our test
+suite. The state for each is as follows:
+- PDFBox: I manually went through all issues and included the ones I deemed necessary. 
+- pdf.js: A large number of tests have been ported, but not all yet. I also still need to go through the pdf.js issue
+  tracker to find other issues that haven't been included in the test suite or are still open.
+- mupdf/ghostscript: Not ported yet.
+- Chromium: PDFs have been taken from the [PDFium issue tracker](https://issues.chromium.org/issues?q=componentid:1586257%20-title:fuzz).
+  The PDFIum repo also has some rendering tests, but since those are rather basic it is not planned to run those in
+  hayro.
+
+## Last synced test
+The following shows the last synced test for each issue tracker, so that we know where to continue from:
+- PDFBox: PDFBOX-6024
+- Chromium: last_modified <= 2025-03-14.

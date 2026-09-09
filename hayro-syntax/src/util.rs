@@ -2,16 +2,16 @@ use crate::sync::OnceLock;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Sub;
-use log::error;
+use smallvec::{Array, SmallVec};
 
 pub(crate) trait OptionLog {
     fn error_none(self, f: &str) -> Self;
 }
 
 impl<T> OptionLog for Option<T> {
-    fn error_none(self, f: &str) -> Self {
+    fn error_none(self, _f: &str) -> Self {
         self.or_else(|| {
-            error!("{f}");
+            error!("{_f}");
 
             None
         })
@@ -36,6 +36,97 @@ impl FloatExt for f32 {
         debug_assert!(tolerance >= 0.0, "tolerance must be non-negative");
 
         self.abs() <= tolerance
+    }
+}
+
+pub(crate) trait ByteBuf: Default {
+    fn with_capacity(capacity: usize) -> Self;
+    fn push(&mut self, byte: u8);
+}
+
+impl ByteBuf for Vec<u8> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity(capacity)
+    }
+
+    fn push(&mut self, byte: u8) {
+        Self::push(self, byte);
+    }
+}
+
+impl<A> ByteBuf for SmallVec<A>
+where
+    A: Array<Item = u8>,
+{
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity(capacity)
+    }
+
+    fn push(&mut self, byte: u8) {
+        Self::push(self, byte);
+    }
+}
+
+#[cfg(feature = "unsafe")]
+pub(crate) fn find_needle(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    memchr::memmem::find(haystack, needle)
+}
+
+#[cfg(feature = "unsafe")]
+pub(crate) fn findr_needle(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    memchr::memmem::rfind(haystack, needle)
+}
+
+#[cfg(not(feature = "unsafe"))]
+pub(crate) fn find_needle(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    let first = needle[0];
+    let mut i = 0;
+
+    while i + needle.len() <= haystack.len() {
+        while haystack.get(i).copied()? != first {
+            i += 1;
+            if i + needle.len() > haystack.len() {
+                return None;
+            }
+        }
+
+        if haystack.get(i..)?.starts_with(needle) {
+            return Some(i);
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+#[cfg(not(feature = "unsafe"))]
+pub(crate) fn findr_needle(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(haystack.len());
+    }
+
+    if needle.len() > haystack.len() {
+        return None;
+    }
+
+    let first = needle[0];
+    let mut i = haystack.len() - needle.len();
+
+    loop {
+        while haystack.get(i).copied()? != first {
+            i = i.checked_sub(1)?;
+        }
+
+        if haystack.get(i..)?.starts_with(needle) {
+            return Some(i);
+        }
+
+        i = i.checked_sub(1)?;
     }
 }
 
@@ -108,5 +199,13 @@ mod tests {
         for s in 0..8 {
             assert!(e.0[s].get().unwrap().iter().all(|s| s.get().is_some()));
         }
+    }
+
+    #[test]
+    fn test_findr_needle() {
+        assert_eq!(findr_needle(b"abc foo def foo xyz", b"foo"), Some(12));
+        assert_eq!(findr_needle(b"abc", b""), Some(3));
+        assert_eq!(findr_needle(b"abc", b"abcd"), None);
+        assert_eq!(findr_needle(b"abc", b"z"), None);
     }
 }

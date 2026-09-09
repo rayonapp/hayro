@@ -3,32 +3,32 @@ use crate::context::Context;
 use crate::device::Device;
 use crate::font::glyph_simulator::GlyphSimulator;
 use crate::font::true_type::{Width, read_encoding, read_widths};
-use crate::font::{Encoding, Glyph, Type3Glyph, UNITS_PER_EM, read_to_unicode};
+use crate::font::{Encoding, GlyphRun, Type3Glyph, UNITS_PER_EM, read_to_unicode};
 use crate::interpret::state::TextState;
-use crate::soft_mask::SoftMask;
 use crate::util::RectExt;
+use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, interpret};
-use crate::{CacheKey, ClipPath, GlyphDrawMode, PathDrawMode};
+use crate::{CacheKey, ClipPath, DrawMode, DrawProps, ImageDrawProps};
 use crate::{Image, Paint};
 use hayro_cmap::{BfString, CMap};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_BBOX, FONT_MATRIX, RESOURCES};
+use hayro_syntax::object::{Dict, ObjectIdentifier};
 use hayro_syntax::page::Resources;
 use kurbo::{Affine, BezPath, Rect};
+use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
-use std::collections::HashMap;
 
 #[derive(Debug)]
 pub(crate) struct Type3<'a> {
     widths: Vec<Width>,
     missing_width: f32,
     encoding: Encoding,
-    encodings: HashMap<u8, String>,
+    encodings: FxHashMap<u8, String>,
     dict: Dict<'a>,
-    char_procs: HashMap<String, Stream<'a>>,
+    char_procs: FxHashMap<String, Stream<'a>>,
     glyph_simulator: GlyphSimulator,
     font_bbox: Rect,
     matrix: Affine,
@@ -50,12 +50,12 @@ impl<'a> Type3<'a> {
         );
 
         let char_procs = {
-            let mut procs = HashMap::new();
+            let mut procs = FxHashMap::default();
             let dict = dict.get::<Dict<'_>>(CHAR_PROCS).unwrap_or_default();
 
             for name in dict.keys() {
-                if let Some(prog) = dict.get::<Stream<'_>>(name.clone()) {
-                    procs.insert(name.as_str().to_string(), prog.clone());
+                if let Some(prog) = dict.get::<Stream<'_>>(name.as_ref()) {
+                    procs.insert(name.as_str().to_string(), prog);
                 }
             }
 
@@ -125,10 +125,10 @@ impl<'a> Type3<'a> {
         let iter = TypedIter::new(decoded.as_ref());
 
         let is_shape_glyph = {
-            let iter = iter.clone();
+            let mut iter = iter.clone();
             let mut is_shape_glyph = true;
 
-            for op in iter {
+            while let Some(op) = iter.next() {
                 match op {
                     TypedInstruction::ShapeGlyph(_) => {
                         break;
@@ -147,10 +147,11 @@ impl<'a> Type3<'a> {
         let mut context = Context::new_with(
             state.ctm,
             self.font_bbox,
-            glyph.cache.clone(),
+            &glyph.cache,
             glyph.xref,
             glyph.settings.clone(),
             state,
+            glyph.nesting_depth,
         );
 
         let mut resources = Resources::from_parent(
@@ -196,17 +197,25 @@ impl<'a, 'b, T: Device<'a>> Type3ShapeGlyphDevice<'a, 'b, T> {
 
 // Only filling, stroking of paths and stencil masks are allowed.
 impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
-    fn set_soft_mask(&mut self, _: Option<SoftMask<'_>>) {}
-
-    fn draw_path(
+    fn begin_optional_content(
         &mut self,
-        path: &BezPath,
-        transform: Affine,
-        _: &Paint<'_>,
-        draw_mode: &PathDrawMode,
-    ) {
-        self.inner
-            .draw_path(path, transform, &self.paint, draw_mode);
+        id: Option<ObjectIdentifier>,
+        properties: &Dict<'_>,
+        visible: bool,
+    ) -> bool {
+        self.inner.begin_optional_content(id, properties, visible)
+    }
+
+    fn end_optional_content(&mut self) {
+        self.inner.end_optional_content();
+    }
+
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        let props = DrawProps {
+            paint: self.paint.clone(),
+            ..props
+        };
+        self.inner.draw_path(path, props, draw_mode);
     }
 
     fn push_clip_path(&mut self, clip_path: &ClipPath) {
@@ -215,30 +224,25 @@ impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
 
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'_>>, _: BlendMode) {}
 
-    fn draw_glyph(
+    fn draw_glyph_run(
         &mut self,
-        g: &Glyph<'a>,
-        transform: Affine,
-        glyph_transform: Affine,
-        p: &Paint<'a>,
-        draw_mode: &GlyphDrawMode,
+        glyph_run: &GlyphRun<'_, 'a>,
+        props: DrawProps<'a>,
+        draw_mode: &DrawMode,
     ) {
-        self.inner
-            .draw_glyph(g, transform, glyph_transform, p, draw_mode);
+        self.inner.draw_glyph_run(glyph_run, props, draw_mode);
     }
 
-    fn pop_clip_path(&mut self) {
-        self.inner.pop_clip_path();
+    fn pop_clip(&mut self) {
+        self.inner.pop_clip();
     }
 
     fn pop_transparency_group(&mut self) {}
 
-    fn draw_image(&mut self, image: Image<'a, '_>, transform: Affine) {
+    fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
         if let Image::Stencil(mut s) = image {
             s.paint = self.paint.clone();
-            self.inner.draw_image(Image::Stencil(s), transform);
+            self.inner.draw_image(Image::Stencil(s), props);
         }
     }
-
-    fn set_blend_mode(&mut self, _: BlendMode) {}
 }
