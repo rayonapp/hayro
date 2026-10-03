@@ -780,3 +780,9 @@ fn deeply_nested_trailer_array() {
     load_pdf(file.as_bytes());
     let _ = hayro_syntax::page_count(file.into_bytes());
 }
+
+#[test]
+fn object_stream_cycle() {
+    let file = include_bytes!("../pdfs/load/object_stream_cycle.pdf");
+    load_pdf(file);
+}
