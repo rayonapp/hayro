@@ -12,6 +12,7 @@ pub(crate) mod flate {
 
     #[cfg(feature = "unsafe")]
     pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
+        use crate::filter::MAX_DECODED_LEN;
         use flate2::read::{DeflateDecoder, ZlibDecoder};
         use std::io::Read;
 
