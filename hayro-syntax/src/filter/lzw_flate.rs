@@ -15,16 +15,21 @@ pub(crate) mod flate {
         use flate2::read::{DeflateDecoder, ZlibDecoder};
         use std::io::Read;
 
-        fn zlib_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = ZlibDecoder::new(data);
+        fn read_capped(decoder: impl Read) -> Option<Vec<u8>> {
             let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
+            decoder
+                .take(MAX_DECODED_LEN as u64 + 1)
+                .read_to_end(&mut result)
+                .ok()?;
+            (result.len() <= MAX_DECODED_LEN).then_some(result)
+        }
+
+        fn zlib_stream(data: &[u8]) -> Option<Vec<u8>> {
+            read_capped(ZlibDecoder::new(data))
         }
 
         fn deflate_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = DeflateDecoder::new(data);
-            let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
+            read_capped(DeflateDecoder::new(data))
         }
 
         let decoded = zlib_stream(data)
@@ -48,6 +53,7 @@ pub(crate) mod flate {
     /// Ported from <https://github.com/mozilla/pdf.js/blob/master/src/core/flate_stream.js>
     /// TODO: Rewrite this in idiomatic Rust.
     mod fallback {
+        use crate::filter::MAX_DECODED_LEN;
         use alloc::vec;
         use alloc::vec::Vec;
 
@@ -97,6 +103,10 @@ pub(crate) mod flate {
             fn decode(&mut self) -> Option<Vec<u8>> {
                 while !self.eof && self.pos < self.data.len() {
                     self.read_block();
+                }
+
+                if self.output.len() > MAX_DECODED_LEN {
+                    return None;
                 }
 
                 Some(core::mem::take(&mut self.output))
@@ -274,6 +284,11 @@ pub(crate) mod flate {
                 };
 
                 loop {
+                    if self.output.len() > MAX_DECODED_LEN {
+                        self.eof = true;
+                        return;
+                    }
+
                     let code1 = match self.get_code(&lit_code_table) {
                         Some(c) => c,
                         None => {
@@ -564,6 +579,7 @@ pub(crate) mod flate {
 
 pub(crate) mod lzw {
     use crate::bit_reader::BitReader;
+    use crate::filter::MAX_DECODED_LEN;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
     use crate::object::Dict;
     use alloc::vec;
@@ -591,6 +607,10 @@ pub(crate) mod lzw {
         let mut prev = None;
 
         loop {
+            if decoded.len() > MAX_DECODED_LEN {
+                return None;
+            }
+
             let next = match reader.read(bit_size) {
                 Some(code) => code as usize,
                 None => {
@@ -1071,6 +1091,26 @@ mod tests {
             // Row 3
             131, 130, 122, 133, 129, 128, 127, 100, 126,
         ]
+    }
+
+    #[test]
+    fn flate_output_past_the_cap() {
+        // A fixed-Huffman block: one literal 0, then copies of 258 bytes at distance 1.
+        let mut bits = Vec::new();
+        let mut push = |code: u32, len: u32| bits.extend((0..len).rev().map(|i| code >> i & 1));
+        push(0b110, 3);
+        push(0b0011_0000, 8);
+        for _ in 0..crate::filter::MAX_DECODED_LEN / 258 + 1 {
+            push(0b1100_0101, 8);
+            push(0, 5);
+        }
+        push(0, 7);
+        let data: Vec<u8> = bits
+            .chunks(8)
+            .map(|byte| byte.iter().enumerate().map(|(i, bit)| (*bit as u8) << i).sum())
+            .collect();
+
+        assert!(flate::decode(&data, &Dict::empty()).is_none());
     }
 
     #[test]

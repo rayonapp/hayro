@@ -20,6 +20,9 @@ use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams};
 use core::ops::Deref;
 
+/// The most a decompressing filter may produce: a small stream can otherwise inflate past memory.
+pub(crate) const MAX_DECODED_LEN: usize = 256 * 1024 * 1024;
+
 /// A data filter.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Filter {

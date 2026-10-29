@@ -823,3 +823,14 @@ fn jbig2_globals_chain() {
         .unwrap();
     let _ = stream.decoded();
 }
+
+#[test]
+fn xref_stream_with_empty_entries() {
+    let body = "%PDF-1.5\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n";
+    let file = format!(
+        "{body}3 0 obj\n<< /Type /XRef /Size 2147483647 /W [0 0 0] /Root 1 0 R /Length 0 >>\nstream\n\nendstream\nendobj\nstartxref\n{}\n%%EOF\n",
+        body.len()
+    );
+    load_pdf(file.as_bytes());
+    let _ = hayro_syntax::page_count(file.into_bytes());
+}

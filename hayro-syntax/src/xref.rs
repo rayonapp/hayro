@@ -884,6 +884,13 @@ fn populate_from_xref_stream<'a>(
         return None;
     }
 
+    // An entry that reads no bytes never runs out of data, so `/Size` alone would bound the loop.
+    if f1_len == 0 && f2_len == 0 && f3_len == 0 {
+        error!("xref stream entries are empty");
+
+        return None;
+    }
+
     // Do such files exist?
     if f1_len != 1 {
         warn!("first field in xref stream was longer than 1");
