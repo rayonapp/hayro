@@ -765,6 +765,12 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                 row_len
             };
 
+            if total_row_len == 0 {
+                warn!("predictor rows are empty");
+
+                return None;
+            }
+
             let num_rows = data.len() / total_row_len;
 
             if !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16) {
@@ -1065,6 +1071,19 @@ mod tests {
             // Row 3
             131, 130, 122, 133, 129, 128, 127, 100, 126,
         ]
+    }
+
+    #[test]
+    fn predictor_with_zero_columns() {
+        let params = PredictorParams {
+            predictor: 2,
+            colors: 3,
+            bits_per_component: 8,
+            columns: 0,
+            early_change: false,
+        };
+
+        assert_eq!(apply_predictor(vec![1, 2, 3], &params), None);
     }
 
     fn predictor_test(predictor: u8, input: &[u8]) {

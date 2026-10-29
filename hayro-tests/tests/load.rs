@@ -792,3 +792,34 @@ fn nested_object_streams() {
     let file = include_bytes!("../pdfs/load/nested_object_streams.pdf");
     load_pdf(file);
 }
+
+#[test]
+fn jbig2_globals_chain() {
+    use hayro_syntax::object::{ObjectIdentifier, Stream};
+    use pdf_writer::{Filter, Name, Pdf as PdfWriter, Rect, Ref};
+
+    let length = 100_000;
+    let page = Ref::new(length + 4);
+    let mut writer = PdfWriter::new();
+    writer.catalog(Ref::new(1)).pages(Ref::new(2));
+    writer.pages(Ref::new(2)).kids([page]).count(1);
+    writer
+        .page(page)
+        .parent(Ref::new(2))
+        .media_box(Rect::new(0.0, 0.0, 595.0, 842.0));
+    for index in 3..length + 3 {
+        let mut stream = writer.stream(Ref::new(index), &[]);
+        stream.filter(Filter::Jbig2Decode);
+        stream
+            .decode_parms()
+            .pair(Name(b"JBIG2Globals"), Ref::new(index + 1));
+    }
+    writer.stream(Ref::new(length + 3), &[]);
+    let pdf = Pdf::new(writer.finish()).unwrap();
+
+    let stream = pdf
+        .xref()
+        .get::<Stream<'_>>(ObjectIdentifier::new(3, 0))
+        .unwrap();
+    let _ = stream.decoded();
+}
