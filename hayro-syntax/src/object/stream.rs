@@ -161,6 +161,18 @@ impl<'a> Stream<'a> {
             .map(|r| r.data)
     }
 
+    /// Return the decoded data of an xref or object stream.
+    ///
+    /// These streams never hold images, and the image decoders allocate from attacker-controlled
+    /// dimensions, so an image filter fails the decode.
+    pub(crate) fn decoded_structure(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        if self.filters().iter().any(Filter::is_image) {
+            return Err(DecodeFailure::StreamDecode);
+        }
+
+        self.decoded()
+    }
+
     /// Return the decoded data of the stream, and return image metadata
     /// if available.
     pub fn decoded_image(

@@ -834,3 +834,19 @@ fn xref_stream_with_empty_entries() {
     load_pdf(file.as_bytes());
     let _ = hayro_syntax::page_count(file.into_bytes());
 }
+
+#[test]
+fn xref_stream_with_image_filter() {
+    let body = "%PDF-1.5\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n";
+    let payload = [73, 189, 252, 55, 47];
+    let mut file = format!(
+        "{body}3 0 obj\n<< /Type /XRef /Size 4 /W [1 1 1] /Root 1 0 R /Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 /Rows 0 >> /Length {} >>\nstream\n",
+        payload.len()
+    )
+    .into_bytes();
+    file.extend(payload);
+    file.extend(format!("\nendstream\nendobj\nstartxref\n{}\n%%EOF\n", body.len()).bytes());
+
+    load_pdf(&file);
+    let _ = hayro_syntax::page_count(file);
+}

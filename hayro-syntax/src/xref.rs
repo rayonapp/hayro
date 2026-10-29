@@ -132,7 +132,7 @@ fn fallback_xref_map_inner<'a>(
 
                         if let Some(stream) = old_r.read::<Stream<'_>>(&dummy_ctx)
                             && dict.get::<Name<'_>>(TYPE).as_deref() == Some(b"ObjStm")
-                            && let Some(data) = stream.decoded().ok()
+                            && let Some(data) = stream.decoded_structure().ok()
                             && let Some(last_obj_num) = last_obj_num
                             && let Some(obj_stream) = ObjectStream::new(stream, &data, &dummy_ctx)
                         {
@@ -207,7 +207,7 @@ fn fallback_xref_map_inner<'a>(
                                 reader.read_with_context::<IndirectObject<Stream<'_>>>(&dummy_ctx)
                                 && {
                                     let stream = stream.get();
-                                    if let Some(data) = stream.decoded().ok()
+                                    if let Some(data) = stream.decoded_structure().ok()
                                         && let Some(object_stream) =
                                             ObjectStream::new(stream, &data, &dummy_ctx)
                                         && let Some(obj) = object_stream.get::<Dict<'_>>(*idx)
@@ -896,7 +896,7 @@ fn populate_from_xref_stream<'a>(
         warn!("first field in xref stream was longer than 1");
     }
 
-    let xref_data = stream.decoded().ok()?;
+    let xref_data = stream.decoded_structure().ok()?;
     let mut xref_reader = Reader::new(xref_data.as_ref());
 
     if let Some(arr) = stream.dict().get::<Array<'_>>(INDEX) {

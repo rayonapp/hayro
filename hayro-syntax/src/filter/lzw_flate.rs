@@ -786,8 +786,9 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                 row_len
             };
 
-            if total_row_len == 0 {
-                warn!("predictor rows are empty");
+            // The row buffers are sized from /Columns, so a row longer than the data is refused.
+            if total_row_len == 0 || total_row_len > data.len() {
+                warn!("predictor rows are empty or longer than the data");
 
                 return None;
             }
@@ -1121,6 +1122,19 @@ mod tests {
             colors: 3,
             bits_per_component: 8,
             columns: 0,
+            early_change: false,
+        };
+
+        assert_eq!(apply_predictor(vec![1, 2, 3], &params), None);
+    }
+
+    #[test]
+    fn predictor_with_rows_longer_than_the_data() {
+        let params = PredictorParams {
+            predictor: 2,
+            colors: 1,
+            bits_per_component: 16,
+            columns: i32::MAX as usize,
             early_change: false,
         };
 

@@ -49,6 +49,13 @@ pub enum Filter {
 }
 
 impl Filter {
+    pub(crate) fn is_image(&self) -> bool {
+        matches!(
+            self,
+            Self::DctDecode | Self::CcittFaxDecode | Self::Jbig2Decode | Self::JpxDecode
+        )
+    }
+
     fn debug_name(&self) -> &'static str {
         match self {
             Self::AsciiHexDecode => "ascii_hex",

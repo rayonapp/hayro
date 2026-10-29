@@ -105,7 +105,7 @@ impl Data {
             self.decoded
                 .get_or_init(idx, || {
                     let stream = ctx.xref().get_with::<Stream<'_>>(id, ctx)?;
-                    stream.decoded().ok().map(Cow::into_owned)
+                    stream.decoded_structure().ok().map(Cow::into_owned)
                 })
                 .as_deref()
         }
