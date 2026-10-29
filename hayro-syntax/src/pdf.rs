@@ -1,7 +1,9 @@
 //! The starting point for reading PDF files.
 
 use crate::PdfData;
+use crate::object::Dict;
 use crate::object::Object;
+use crate::object::dict::keys::COUNT;
 use crate::page::Pages;
 use crate::page::cached::CachedPages;
 use crate::reader::Reader;
@@ -105,6 +107,22 @@ impl Pdf {
     pub fn metadata(&self) -> &Metadata {
         self.xref.metadata()
     }
+}
+
+/// Read the page count that a PDF's page tree declares, without loading its pages.
+///
+/// Returns `None` if the PDF can't be read, can't be decrypted with an empty password
+/// or declares no count.
+pub fn page_count(data: impl Into<PdfData>) -> Option<usize> {
+    let data = data.into();
+    let xref = match root_xref(data.clone(), b"") {
+        Ok(xref) => xref,
+        Err(XRefError::Unknown) => fallback(data, b"")?,
+        Err(XRefError::Encryption(_)) => return None,
+    };
+    let pages = xref.get::<Dict<'_>>(xref.trailer_data().pages_ref)?;
+
+    usize::try_from(pages.get::<i32>(COUNT)?).ok()
 }
 
 fn find_version(data: &[u8]) -> Option<PdfVersion> {

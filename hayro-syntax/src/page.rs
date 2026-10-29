@@ -56,6 +56,7 @@ impl<'a> Pages<'a> {
             &mut pages,
             pages_ctx,
             Resources::new(Dict::empty(), None, ctx),
+            0,
         )?;
 
         Some(Self { pages, xref })
@@ -102,12 +103,20 @@ impl<'a> Deref for Pages<'a> {
     }
 }
 
+/// Real page trees are a few levels deep; a crafted one can be deep enough to overflow the stack.
+const MAX_PAGE_TREE_DEPTH: usize = 64;
+
 fn resolve_pages<'a>(
     pages_dict: &Dict<'a>,
     entries: &mut Vec<Page<'a>>,
     mut ctx: PagesContext,
     resources: Resources<'a>,
+    depth: usize,
 ) -> Option<()> {
+    if depth >= MAX_PAGE_TREE_DEPTH {
+        return None;
+    }
+
     if let Some(media_box) = pages_dict.get::<Rect>(MEDIA_BOX) {
         ctx.media_box = Some(media_box);
     }
@@ -130,7 +139,7 @@ fn resolve_pages<'a>(
     for dict in kids.iter::<Dict<'_>>() {
         match dict.get::<Name<'_>>(TYPE).as_deref() {
             Some(PAGES) => {
-                resolve_pages(&dict, entries, ctx.clone(), resources.clone());
+                resolve_pages(&dict, entries, ctx.clone(), resources.clone(), depth + 1);
             }
             // Let's be lenient and assume it's a `Page` in case it's `None` or something else
             // (see corpus test case 0083781).

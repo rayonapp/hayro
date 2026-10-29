@@ -743,3 +743,40 @@ fn encrypted_oob_length() {
     let file = include_bytes!("../pdfs/load/encrypted_oob_length.pdf");
     load_pdf(file);
 }
+
+#[test]
+fn deeply_nested_page_tree() {
+    use pdf_writer::{Pdf as PdfWriter, Rect, Ref};
+
+    let depth = 100_000;
+    let mut writer = PdfWriter::new();
+    writer.catalog(Ref::new(1)).pages(Ref::new(2));
+    for level in 2..depth + 2 {
+        writer
+            .pages(Ref::new(level))
+            .kids([Ref::new(level + 1)])
+            .count(1);
+    }
+    writer
+        .page(Ref::new(depth + 2))
+        .parent(Ref::new(depth + 1))
+        .media_box(Rect::new(0.0, 0.0, 595.0, 842.0));
+    let file = writer.finish();
+
+    assert_eq!(hayro_syntax::page_count(file.clone()), Some(1));
+    let pdf = Pdf::new(file).unwrap();
+    assert_eq!(pdf.pages().len(), 0);
+}
+
+#[test]
+fn deeply_nested_trailer_array() {
+    let body = "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n";
+    let file = format!(
+        "{body}xref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n{:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R /Junk {} >>\nstartxref\n{}\n%%EOF\n",
+        body.find("2 0 obj").unwrap(),
+        "[".repeat(1_000_000),
+        body.len()
+    );
+    load_pdf(file.as_bytes());
+    let _ = hayro_syntax::page_count(file.into_bytes());
+}
