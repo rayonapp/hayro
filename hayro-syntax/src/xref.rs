@@ -750,6 +750,10 @@ fn populate_xref_impl<'a>(data: &'a [u8], pos: usize, xref_map: &mut XrefMap) ->
 /// Maximum number of allowed xref `Prev` pointers before we abort.
 const MAX_XREF_CHAIN_DEPTH: usize = 256;
 
+/// Half the 8,388,607 indirect objects ISO 32000 allows. Each entry costs about 80 bytes, and a
+/// 256 MiB decoded stream could otherwise declare 256M of them.
+const MAX_XREF_ENTRIES: usize = 1 << 22;
+
 fn populate_xref_impl_inner<'a>(
     data: &'a [u8],
     pos: usize,
@@ -962,6 +966,12 @@ fn xref_stream_subsection<'a>(
     insert_map: &mut XrefMap,
 ) -> Option<()> {
     for i in 0..num_elements {
+        if insert_map.len() >= MAX_XREF_ENTRIES {
+            error!("xref stream has more than {MAX_XREF_ENTRIES} entries");
+
+            return None;
+        }
+
         let f_type = if f1_len == 0 {
             1
         } else {
@@ -1072,6 +1082,10 @@ struct ObjectStream<'a> {
 impl<'a> ObjectStream<'a> {
     fn new(inner: Stream<'_>, data: &'a [u8], ctx: &ReaderContext<'a>) -> Option<Self> {
         let num_objects = inner.dict().get::<usize>(N)?;
+
+        if num_objects > MAX_XREF_ENTRIES {
+            return None;
+        }
         let first_offset = inner.dict().get::<usize>(FIRST)?;
 
         let mut r = Reader::new(data);
@@ -1138,6 +1152,24 @@ fn parse_metadata(info_dict: &Dict<'_>) -> Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xref_stream_past_the_entry_cap() {
+        let data = vec![1; MAX_XREF_ENTRIES + 1];
+        let mut xref_map = FxHashMap::default();
+
+        let result = xref_stream_subsection(
+            &mut Reader::new(&data),
+            0,
+            data.len() as u32,
+            1,
+            0,
+            0,
+            &mut xref_map,
+        );
+
+        assert!(result.is_none());
+    }
 
     #[test]
     fn circular_prev_chain() {
