@@ -64,11 +64,6 @@ fn xobject_oc(dict: &Dict<'_>, context: &mut Context<'_>) -> bool {
         return false;
     };
 
-    if let Some(oc_ref) = dict.get_ref(OC) {
-        context.ocg_state.begin_ocg(&oc_dict, oc_ref.into());
-    } else {
-        context.ocg_state.begin_ocmd(&oc_dict);
-    }
-
-    true
+    let id = dict.get_ref(OC).map(Into::into);
+    context.ocg_state.begin_optional_content(&oc_dict, id)
 }
