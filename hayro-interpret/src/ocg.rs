@@ -1,17 +1,19 @@
-use hayro_syntax::object::dict::keys::{BASE_STATE, D, OCGS, OCMD, OCPROPERTIES, OFF, ON, P, TYPE};
+use hayro_syntax::object::dict::keys::{
+    BASE_STATE, D, OCG, OCGS, OCMD, OCPROPERTIES, OFF, ON, P, TYPE,
+};
 use hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier};
 use std::collections::HashSet;
 
 pub(crate) struct OcgState {
     inactive_ocgs: HashSet<ObjectIdentifier>,
-    visibility_stack: Vec<bool>,
+    content_stack: Vec<bool>,
 }
 
 impl OcgState {
     fn dummy() -> Self {
         Self {
             inactive_ocgs: HashSet::default(),
-            visibility_stack: vec![],
+            content_stack: Vec::new(),
         }
     }
 
@@ -61,17 +63,11 @@ impl OcgState {
 
         Self {
             inactive_ocgs: inactive,
-            visibility_stack: Vec::new(),
+            content_stack: Vec::new(),
         }
     }
 
-    pub(crate) fn begin_single_oc(&mut self, ocg_id: ObjectIdentifier) {
-        let is_active = !self.inactive_ocgs.contains(&ocg_id);
-        let visible = self.is_visible() && is_active;
-        self.visibility_stack.push(visible);
-    }
-
-    pub(crate) fn begin_ocmd(&mut self, ocmd: &Dict<'_>) {
+    fn ocmd_is_visible(&self, ocmd: &Dict<'_>) -> bool {
         let policy = ocmd
             .get::<Name<'_>>(P)
             .and_then(|n| OcmdPolicy::from_name(n.as_ref()))
@@ -89,7 +85,7 @@ impl OcgState {
             ocg_ids.push(ref_.into());
         }
 
-        let is_active = if ocg_ids.is_empty() {
+        if ocg_ids.is_empty() {
             true
         } else {
             match policy {
@@ -98,30 +94,39 @@ impl OcgState {
                 OcmdPolicy::AnyOff => ocg_ids.iter().any(|id| self.inactive_ocgs.contains(id)),
                 OcmdPolicy::AllOff => ocg_ids.iter().all(|id| self.inactive_ocgs.contains(id)),
             }
-        };
-
-        let visible = self.is_visible() && is_active;
-        self.visibility_stack.push(visible);
-    }
-
-    pub(crate) fn begin_ocg(&mut self, props: &Dict<'_>, ref_id: ObjectIdentifier) {
-        match props.get::<Name<'_>>(TYPE).as_deref() {
-            Some(OCMD) => self.begin_ocmd(props),
-            _ => self.begin_single_oc(ref_id),
         }
     }
 
+    pub(crate) fn begin_optional_content(
+        &mut self,
+        props: &Dict<'_>,
+        id: Option<ObjectIdentifier>,
+    ) -> bool {
+        let visible = match props.get::<Name<'_>>(TYPE).as_deref() {
+            Some(OCMD) => self.ocmd_is_visible(props),
+            Some(OCG) => id.is_none_or(|id| !self.inactive_ocgs.contains(&id)),
+            _ => return false,
+        };
+
+        self.content_stack.push(self.is_visible() && visible);
+
+        true
+    }
+
     pub(crate) fn begin_marked_content(&mut self) {
-        let visible = self.is_visible();
-        self.visibility_stack.push(visible);
+        self.content_stack.push(self.is_visible());
     }
 
     pub(crate) fn end_marked_content(&mut self) {
-        self.visibility_stack.pop();
+        self.content_stack.pop();
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        self.visibility_stack.last().copied().unwrap_or(true)
+        self.content_stack.last().copied().unwrap_or(true)
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.content_stack.len()
     }
 }
 

@@ -45,7 +45,7 @@ pub(crate) fn append_text_string<'a>(
         let (code, adv) = font.read_code(bytes, cur_idx);
         cur_idx += adv;
 
-        if show_glyphs && ctx.ocg_state.is_visible() {
+        if show_glyphs && (ctx.ocg_state.is_visible() || ctx.text_state().render_mode.clips()) {
             let origin_displacement = font.origin_displacement(code);
             let transform = ctx.text_state().full_transform()
                 * Affine::scale(1.0 / UNITS_PER_EM as f64)
@@ -74,7 +74,13 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
         return;
     }
 
-    let render_mode = ctx.text_state().render_mode;
+    // Hidden text still contributes to the clipping path.
+    let visible = ctx.ocg_state.is_visible();
+    let render_mode = if visible {
+        ctx.text_state().render_mode
+    } else {
+        TextRenderingMode::Clip
+    };
     let stroke_props = ctx.stroke_props().clone();
     let fill_props = ctx.draw_props(false);
     let stroke_draw_props = ctx.draw_props(true);
@@ -91,13 +97,7 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
             writing_mode,
         };
 
-        let clip_path = if matches!(
-            render_mode,
-            TextRenderingMode::Clip
-                | TextRenderingMode::FillAndClip
-                | TextRenderingMode::StrokeAndClip
-                | TextRenderingMode::FillAndStrokeAndClip
-        ) {
+        let clip_path = if render_mode.clips() {
             let mut clip_path = BezPath::new();
             for glyph in run.glyphs() {
                 clip_glyph(&mut clip_path, glyph);
@@ -133,6 +133,7 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
                 device.draw_glyph_run(&run, fill_props, &DrawMode::Fill(FillRule::NonZero));
                 device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
             }
+            TextRenderingMode::Clip if !visible => {}
             TextRenderingMode::Clip => {
                 // TODO: Pass clipping-only text with its own draw mode, so that devices
                 // can tell it apart from invisible text.
@@ -175,4 +176,13 @@ pub(crate) enum TextRenderingMode {
     StrokeAndClip,
     FillAndStrokeAndClip,
     Clip,
+}
+
+impl TextRenderingMode {
+    fn clips(self) -> bool {
+        matches!(
+            self,
+            Self::Clip | Self::FillAndClip | Self::StrokeAndClip | Self::FillAndStrokeAndClip
+        )
+    }
 }
